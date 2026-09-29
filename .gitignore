@@ -6,6 +6,7 @@ code
 *.elf
 *.vcd
 *.fst
+references/
 # Ignore root crash dumps without hiding RTL or source directories named core.
 /core
 !/core/
