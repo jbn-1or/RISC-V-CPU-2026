@@ -17,3 +17,6 @@ __pycache__/
 
 # Downloaded course hardware tools.
 *.AppImage
+
+# Local Kilo agent workspace state.
+.kilo/
