@@ -9,6 +9,8 @@
 #   * 不需要额外安装 Verilator —— AppImage 里自带（$APPDIR/bin/verilator）；
 #   * --binary --timing：生成并运行仿真程序，支持测试里的 #延时；
 #   * -Wno-fatal：警告不致命（与框架 make build 的配置一致，不加会因警告直接失败）；
+#   * scripts/ram/sram_fakeram.sv 总是加入编译列表：未实例化时 Verilator 只解析
+#     不例化、无副作用，需要片上 RAM 的测试顶层直接实例化即可；
 #   * 产物写到 build/ut_<top>/（build/ 已在 .gitignore 中，不会污染仓库）。
 set -e
 
@@ -37,6 +39,7 @@ exec "$APPIMAGE" exec /bin/sh -c "
         verilog/stubs/be_sink.sv \
         verilog/stubs/fe_stub.sv \
         verilog/stubs/$TOP.sv \
+        scripts/ram/sram_fakeram.sv \
         --Mdir '$OUT' -o $TOP &&
     ./'$OUT'/$TOP
 "

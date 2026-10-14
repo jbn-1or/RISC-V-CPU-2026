@@ -33,8 +33,9 @@ sh verilog/stubs/run_ut.sh tb_my_decoder      # 自己的测试顶层（也要�
 
 ## 自己加测试顶层时的注意事项
 
-1. 需要片上 RAM 的模块，把 `scripts/ram/sram_fakeram.sv` 加进 `run_ut.sh` 的编译列表即可
-   （`docs/sram.md` 明确允许框架外仿真这么用）。
+1. `run_ut.sh` 已把 `scripts/ram/sram_fakeram.sv` 自动加入编译列表
+   （`docs/sram.md` 明确允许框架外仿真这么用；未实例化时只解析不例化，无副作用），
+   需要片上 RAM 的测试顶层直接实例化即可。
 2. 断言写成 `if (!条件) $fatal(1, "消息")`。
 3. 单元测试只保证子模块单独正确，**每天结束前仍要在主干跑一次 `make test`**。
 4. 跨人接口只允许用 `verilog/cpu_pkg.sv` 里的类型；改契约要走 PR 双审。
@@ -43,4 +44,4 @@ sh verilog/stubs/run_ut.sh tb_my_decoder      # 自己的测试顶层（也要�
    `No rule to make target '/tmp/.mount_cpu202Xxx/verilator/include/verilated.cpp'`。
    （`run_ut.sh` 已经替你做了 `rm -rf`，这也是框架 `scripts/build.py` 的同样做法。）
 
-分工、对接流程与接口契约说明见 [`../../references/分工方案.md`](../../references/分工方案.md)。
+分工、对接流程与接口契约说明见 [`../../references/teamplan.md`](../../references/teamplan.md)。
