@@ -36,6 +36,22 @@ exec "$APPIMAGE" exec /bin/sh -c "
     \$APPDIR/bin/verilator --binary --timing -Wall -Wno-fatal \
         --top-module $TOP \
         verilog/cpu_pkg.sv \
+        verilog/frontend/decode.sv \
+        verilog/frontend/bp.sv \
+        verilog/backend/div.sv \
+        verilog/backend/alu.sv \
+        verilog/backend/bru.sv \
+        verilog/backend/mul.sv \
+        verilog/backend/prf.sv \
+        verilog/backend/rob.sv \
+        verilog/backend/rename.sv \
+        verilog/backend/iq.sv \
+        verilog/backend/wb_skid.sv \
+        verilog/backend/core_ooo.sv \
+        verilog/memory/lsu_b.sv \
+        verilog/memory/lsu_a.sv \
+        verilog/memory/dcache.sv \
+        verilog/memory/axi_master.sv \
         verilog/stubs/be_sink.sv \
         verilog/stubs/fe_stub.sv \
         verilog/stubs/$TOP.sv \

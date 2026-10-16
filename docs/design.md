@@ -172,9 +172,10 @@ parameter int ASSOC        = 1;   // 相联度（1=直接映射；逻辑按 ASSO
 parameter int MSHR_N       = 2;   // D$ 未命中合并项数
 parameter int AXI_MAX_RD   = 8;   // 在飞 AXI 读上限（≤ 从机 R 队列 16 − 裕量）
 parameter int AXI_MAX_WR   = 8;   // 在飞 AXI 写上限
-parameter int BHT_ENTRIES  = 128; // 2-bit 计数器数
-parameter int BTB_ENTRIES  = 32;
-parameter int RAS_DEPTH    = 8;
+parameter int BHT_ENTRIES  = 256; // 方向表项数（锦标赛：bimodal+gshare+choice 三表）
+parameter int BTB_ENTRIES  = 128;
+parameter int RAS_DEPTH    = 16;
+parameter int BP_GHR_BITS  = 8;   // gshare GHR 宽（0=纯 bimodal；有效历史=min(值, log2(BHT_ENTRIES))）
 ```
 
 三档配置（§13）除这组参数外代码零差异。
@@ -277,15 +278,16 @@ LSU 分配记录时直接覆盖同号旧记录（旧记录只可能是已完成�
 
 | 结构 | 参数 | 算法 |
 | --- | --- | --- |
-| BHT | `BHT_ENTRIES=128` × 2-bit | `index = pc[8:2]`，2 位饱和计数方向预测 |
-| BTB | 32 项 | tag + 目标 PC（tag 取 `pc[31:7]` 截短），用于 JALR 目标猜测 |
-| RAS | 8 深 | 译码见 JAL/JALR 且 `rd∈{x1,x5}` → 压栈（返回地址 = 当前 pc+4）；JALR 且 `rs1∈{x1,x5} 且 rd=x0` → 弹栈作目标 |
+| BHT（锦标赛） | `BHT_ENTRIES=256` × 三表 | bimodal（`index=pc`）+ gshare（`index=pc^GHR`）+ 每 pc 选择表；两方向表同步训练，选择表向"预测正确的一方"训练 |
+| GHR | `BP_GHR_BITS=8` | **随取指程序序**按预测方向移位；该分支的 gshare 索引随指令携带（`decoded_t` 系载荷的 `bix` 字段）到 BRU 训练——**预测与训练同索引**；任何误预测（含 JALR）按携带索引恢复 GHR（条件分支再移入实际结果） |
+| BTB | 128 项 | tag + 目标 PC（tag 取 `pc[31:BI+2]` 截短），用于 JALR 目标猜测 |
+| RAS | 16 深 | 译码见 JAL/JALR 且 `rd∈{x1,x5}` → 压栈（返回地址 = 当前 pc+4）；JALR 且 `rs1∈{x1,x5} 且 rd=x0` → 弹栈作目标 |
 | 顺序路径 | — | 预测不跳转 → 连取下一个 8B 块 |
 
 规则：
 - S2 译码出 `JAL`（无条件直跳）不冲刷：直接修正下块 PC（1 拍 bubble）。
-- BRU 解析回灌：BHT 计数更新；误预测或 BTB-miss 的分支写入 BTB；RAS 误弹不修复
-  （已知局限：qsort/tak 递归深度 ~10，`RAS_DEPTH=8` 够用，溢出弃底不回卷）。
+- BRU 解析回灌：BHT **按携带索引**更新（预测/训练同索引，见上表 GHR 行）；误预测或 BTB-miss 的分支写入 BTB；RAS 误弹不修复
+  （已知局限：qsort/tak 递归深度 ~10，`RAS_DEPTH=16` 覆盖，溢出弃底不回卷）。
 - 重定向：BRU `flush_t.pc` 寄存 1 拍 → S0 重启，总 bubble ≈ 4~6 拍。
 
 ### 5.3 译码（`decode.sv`）
@@ -662,3 +664,91 @@ bsf="branches seen before"（某指令之前已译码分支数）；BHT/BTB/RAS=
 
 
 
+
+---
+
+## 16. 阶段 2 冲刺设计（IPC GEOMEAN ≥ 0.8450；M6~M11）
+
+> v1.1 增补（2026-10-16 第二窗定稿）。置于附录之后仅为避免重编号；**本节是阶段 2（cfg-base，95 分档）的实现蓝本：实现与本文冲突时先改本文（PR）再改代码**。
+> 基线：GEOMEAN **0.6489** / 4,475.4 µm² / 383.66 MHz（2026-10-16 第二窗终态）。
+> **每步硬门禁（缺一即停）**：面积 ≤18,000 µm²；频率 ≥300 MHz（护栏 ≥320，破线即重排或回退该里程碑）；全量回归不退化（`make test` 19/19 + UT 6/6 + `make perf` + LATITUDE=1/50）。
+
+### 16.1 目标向量（+30% 落到每个用例）
+
+GEOMEAN=0.845 等价于六项 IPC 乘积 ≈0.364，差距按对数均摊：
+
+| 用例 | 现状 IPC | 目标 IPC | 倍率 | 主要可回收 stall（探针证据） |
+| --- | ---: | ---: | ---: | --- |
+| qsort | 0.462 | ~0.66 | ×1.43 | 条件分支误预测 25% + store 保序阻塞 |
+| towers | 0.525 | ~0.74 | ×1.41 | 误预测 30% + LSU 串行 |
+| vvadd | 0.660 | ~0.92 | ×1.39 | rob_full 52% + LSU 单口 |
+| median | 0.641 | ~0.88 | ×1.37 | 依赖链 + LSU 单口 |
+| rsort | 0.810 | ~0.97 | ×1.20 | store-head 阻塞 35% |
+| multiply | 0.897 | ~0.96 | ×1.07 | 误预测 10% + 乘法链 |
+
+推论：**"预测、访存乱序、访存宽度"必须三管齐下**；零误预测的完美预测器也只能把 GEOMEAN 抬到 ~0.71（对数均摊反推），单靠任何一项都到不了 0.845。
+
+### 16.2 M6：测量先行（不动任何功能逻辑）
+
+探针纪律：一律 `$fopen/$fwrite` 到 `build/dbg_probe.log`（**绝不污染 test/perf stdout**），当天清零三步验证（清零 → 重建 → 关键用例周期一致）。
+
+| 探针 | 位置 | 量什么 | 决定什么 |
+| --- | --- | --- | --- |
+| P1 分支流离线建模 | `core_ooo` 打 `(pc, op, taken, pred)` 流 | 离线模拟 bimodal/gshare/**TAGE 变体**（表数/历史长/tag 宽）的可达误预测率 | **M7 的 TAGE 配置**（选型后才写 RTL） |
+| P2 LSU 并行度 | `lsu_b` | 同拍 ≥2 条就绪 WAIT load 的周期占比 + 两 load 同 set/同 bank 冲突率 | M9 的收益上限与 bank 方案 |
+| P3 store-head 归因 | `iq`/`lsu_b` | 被堵周期里 store 未就绪的原因 = 地址操作数未就绪 / 数据操作数未就绪 / STQ 满 | **M8 收益上限**（数据未就绪占比越高越值） |
+| P4 依赖链 | `iq`/`core_ooo` | `zn_dep` 中 load→use 链占比 | M10 必做项的空间 |
+
+### 16.3 M7：TAGE 方向预测（`frontend/bp.sv`）
+
+- 结构：base bimodal（沿用 `bht_b`）+ 3 张 tagged 历史表（GHR 8/24/64 折叠索引）+ 8~9b tag + 2b ctr + useful 位；最长匹配胜出；useful 位控制分配/失效。
+- **一致性铁律**（本仓实测教训：不一致使 qsort 误预测 24.8%→38.6%）：预测与训练必须同一索引 ⇒ 携带字段由 `bix`（8b，gshare 索引）扩为 `{命中表号, 各表索引}`（≈30~40b，`fe2rn_t/renamed_t/issue_t` 只增）；GHR 扩到 64b。
+- flush 恢复：沿用"由携带索引重建低 GHR 位 + 实际结果移位（条件分支）/不移位（JALR）"机制；**长历史表允许部分失真**，由 useful 位自愈（不追求完美检查点）。
+- 验收：`tb_bp` 重写；误预测率探针复核；门 **G1：GEOMEAN ≥0.67 且 qsort 误预测 ≤16%、towers ≤20%**。
+
+### 16.4 M8：访存乱序（store 地址早知；**无投机版本**）
+
+机制（全部可证保序，不引入违规重放）：
+1. **IQ（§6.3 修订）**：store 项**仅 rs1（地址）就绪即可发射**（rs2 数据未就绪不阻塞发射）；携带 `ps2` 到 LSU。
+2. **STQ（§7.1 修订）**：表项增 `data_valid=0` + `ps2`；**WB 总线 CAM 匹配回填数据**；drain 门槛 = 退役 ∧ `data_valid`；store 的 ROB done 时机相应调整（实现时二选一并重证 §6.2.2 提前退役安全性）。
+3. **load 门槛（iq.sv）**：从"早于最老未发射 store"放宽为"早于**最老地址未知**的 store"。
+4. **前递/阻塞（§7.2 规则不变）**：与重叠但数据未就绪的更老 store 仍按规则 2 阻塞；`same-line 守卫`（stale-line guard）在地址已知条件下重审，能收窄为"仅重叠阻塞"须写论证。
+
+保序论证义务（必须写进 `iq.sv` 注释）：load 发射时所有更老 store 的**地址**均已知且已在 STQ ⇒ 重叠判定完整；数据未就绪只影响前递来源选择，不影响"是否需要等"。更年轻 store 不可能先脏化（drain 仍退役后、程序序）。
+
+验收：保序论证注释 + **提交级 golden 对拍**（qsort/rsort）+ tak/queens/hanoi flush 压测 + LATENCY=1/50；门 **G2：GEOMEAN ≥0.72**。预期 rsort/vvadd +15~25%、qsort/towers 再 +8~12%。
+
+### 16.5 M9：双发 LSU + 双读 D$
+
+- **D$（§7.3 修订）**：双读口（两路独立 `acc_word/acc_set`；**不同 bank 并行、同 bank 冲突一方 replay**）；store 写/回填共享写口；`MSHR_N→4` 且**每 set 2 项**。
+- **LSU（§7.1 修订）**：双路 load 调度器（两个锁存候选，按程序序 key）；LDQ 双分配口。
+- **IQ（§6.3 修订）**：LSU 每拍最多 2 项（store-head + 更老 load，或两条 load）；**store 仍严格程序序**。
+- 风险：深 mux/CAM 掉频——每步 synth 门禁；门 **G3：GEOMEAN ≥0.76 且频率 ≥320 MHz**。
+
+### 16.6 M10：延迟与宽度（门控项）
+
+- 必做：load 命中数据**更早唤醒 IQ**（消 1 拍 load-use）；`WB_BYPASS` 覆盖面复查。
+- 门控（仅 G3 未过时启动）：3 发射/3 ALU/WB 3 总线/PRF 3W/取指 16B——牵动 §3.4 `ISSUE_WIDTH` 缩放规则全链，属"第二代核心"级改动，缺口 ≤10% 才值得做。
+
+### 16.7 Go/No-Go 门、预算与降级
+
+| 门 | 条件 | 不过怎么办 |
+| --- | --- | --- |
+| G1（M7 后） | ≥0.67 且 qsort 误预测 ≤16% | 复查 TAGE 配置/一致性；仍不过则压缩投入直推 M8 |
+| G2（M8 后） | ≥0.72 | 重跑 P3 归因；若阻塞主导项不是"数据未就绪"则重审机制 |
+| G3（M9 后） | ≥0.76 且频率 ≥320 MHz | 频率破线先重排（减表/减 MSHR/切级）；IPC 不足启动 M10 门控项 |
+| G4（M10 后） | ≥0.845 | **判定阶段 2 在合理范围内不可达** → 降级路线 |
+
+| 面积增量（估） | 累计 |
+| --- | --- |
+| 基线 4,475.4 | — |
+| M7 ~0.3k / M8 ~0.5k / M9 1.5~3k / M10（门控）1~3k | ≤11.3k ≪ 18,000 ✓ |
+
+预算不是瓶颈，**频率门禁与正确性（M8/M9 动访存内核）才是**：每里程碑独立可回退、每步 golden 对拍、M8 先无投机版本。
+
+降级路线（G4 失败）：锁定阶段 1（90 分）+ 冲 **400 MHz（+2）/ 500 MHz（+4）**（383.66→400 需 −4.1% 周期；已知深链 = IQ 唤醒/选择 CAM、rename 优先级编码、ROB 恢复扫描、LSU CAM，可切级）。
+
+### 16.8 契约增补预告（`cpu_pkg` 只增不删）
+
+- 新参数：`BP_TAGE_*`（表数/基础历史/历史步进/tag 宽）等；`MSHR_N` 值变更 2→4；携带字段 `bix` 扩宽为 TAGE 索引组。
+- 一切新字段/新参数先改 `cpu_pkg`（PR 双审纪律），随后**全链透传并全树 grep 窄连线**（端口宽度一律与 `cpu_pkg` 派生一致，防 Yosys `Resizing cell port`）。

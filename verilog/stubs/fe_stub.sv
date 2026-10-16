@@ -30,8 +30,11 @@ module fe_stub #(
                      fu:        FU_ALU,
                       uses_rs1:  1'b0,
                       uses_rs2:  1'b0,
+                      uses_imm:  1'b0,
                       is_branch: 1'b0,
+                      is_ret:    1'b0,
                       is_exit:   1'b0,
+                      is_fuse:   1'b0,
                       funct3:    3'b000,
                       funct7:    7'b0,
                       illegal:   1'b0};

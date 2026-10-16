@@ -267,3 +267,20 @@ make synth MODE=diagnose                 # 面积热点定位第一轮
 - 任何任务完成定义固定为：**代码 + UT/抽样绿 + 留档（D6）**三件套，缺一不算完。
 
 
+
+---
+
+## 13. 阶段 2 冲刺排程（对应 `docs/design.md §16`；2026-10-16 定稿）
+
+> 设计细节（机制/保序论证/验收判据）一律以 design.md §16 为准；本节是排程与出门条件。基线：GEOMEAN 0.6489 / 4,475.4 µm² / 383.66 MHz。
+
+| 里程碑 | 内容 | 面积增量（估） | 出门条件（硬门禁：面积 ≤18,000、频率 ≥320 护栏、全量回归） |
+| --- | --- | --- | --- |
+| M6 | 四探针测量 + 离线建模（P1 分支流/TAGE 选型、P2 LSU 并行度、P3 store-head 归因、P4 load-use） | 0 | 四份量化结论进 handoff；探针清零三步验证 |
+| M7 | TAGE（bp.sv + 携带字段扩宽全链） | ~0.3k | **G1**：GEOMEAN ≥0.67 且 qsort 误预测 ≤16%；UT/回归全绿 |
+| M8 | store 地址早知 + load 门槛放宽（无投机；iq/lsu_b） | ~0.5k | **G2**：≥0.72；保序论证注释 + **golden 对拍（qsort/rsort）** + flush 压测 + LATITUDE=1/50 |
+| M9 | 双发 LSU + 双读 D$（iq/lsu_b/dcache；同 bank replay；MSHR→4） | 1.5~3k | **G3**：≥0.76 且频率 ≥320 MHz |
+| M10 | load-use 降延迟（必做）；3 发射等宽度项（门控） | 1~3k（门控） | G4 冲 ≥0.845；未达则按 design §16.7 降级 |
+| M11 | 参数定格 + 频率护栏复核 + 全量留档 + 文档收口 | ~0 | 阶段 2 三元组定格或降级结论成立 |
+
+每里程碑独立可回退；每步 `make test`（20M）+ `sh build/run_all_ut.sh` + `make perf` + `make synth MODE=opt` 冒烟留档 `references/synth-history/`（**synth 会清 `build/sim`，先 `make build` 再跑 test/perf**）。
