@@ -49,6 +49,22 @@ module student_top (
     wire             btb_upd_valid;
     wire [31:0]      btb_upd_pc, btb_upd_target;
 
+    // M8b: combinational early redirect (BRU resolve cycle) -> frontend.
+    // The frontend's flush is advanced one cycle (the backend still receives
+    // the registered `flush`), so the PC restarts at the correct target one
+    // cycle earlier while the ROB/IQ/LSU kill protocol is unchanged.
+    wire             co_redir_valid;
+    wire [31:0]      co_redir_pc;
+    wire [5:0]       co_redir_bsf;
+
+    cpu_pkg::flush_t fe_flush;
+    always_comb begin
+        fe_flush       = flush;
+        fe_flush.valid = co_redir_valid;
+        fe_flush.pc    = co_redir_pc;
+        fe_flush.bsf   = co_redir_bsf;
+    end
+
     decode u_dec (
         .in_valid_s(fu_dec_valid), .in_pc_s(fu_dec_pc), .in_raw_s(fu_dec_raw),
         .out_d0(dec_d0), .out_d1(dec_d1), .out_valid(dec_ov));
@@ -62,7 +78,7 @@ module student_top (
     wire [31:0] fu_rsp_data;
 
     fetch_unit u_fe (
-        .clock, .reset, .flush,
+        .clock, .reset, .flush(fe_flush),
         .dec_pc_s(fu_dec_pc), .dec_raw_s(fu_dec_raw), .dec_valid_s(fu_dec_valid),
         .dec_out_valid(dec_ov), .dec_d0(dec_d0), .dec_d1(dec_d1),
         .fe_valid, .fe0, .fe1, .fe_take,
@@ -85,11 +101,13 @@ module student_top (
         .clock, .reset,
         .fe_valid, .fe0, .fe1, .fe_take, .flush_out(flush),
         .flush_dtail_out(co_flush_dtail),
+        .redir_valid(co_redir_valid), .redir_pc(co_redir_pc), .redir_bsf(co_redir_bsf),
         .br_upd_valid, .br_upd_pc, .br_upd_taken, .br_upd_ix, .br_upd_mispred,
         .btb_upd_valid, .btb_upd_pc, .btb_upd_target,
         .ld_valid(co_ld_valid), .ld_req(co_ld_req), .ld_ready(co_ld_ready),
         .st_valid(co_st_valid), .st_req(co_st_req), .st_ready(co_st_ready),
-        .resp_valid(co_resp_valid), .resp(co_resp), .resp_replay(co_resp_replay));
+        .resp_valid(co_resp_valid), .resp(co_resp), .resp_replay(co_resp_replay),
+        .probe_addr(dc_probe_addr), .probe_hit(dc_probe_hit));
 
     // ---------------- A-side memory subsystem: lsu_a + dcache ----------------
     wire        la_rd_v, la_rd_ready, la_rd_rsp_valid, la_rd_rsp_ready;
@@ -99,10 +117,15 @@ module student_top (
     wire [31:0] la_wr_addr, la_wr_data;
     wire [3:0]  la_wr_strb, la_wr_tag, la_wr_rsp_tag;
 
+    // M9c: D$ tag probe (lsu_b -> lsu_a/dcache) for same-line guard relaxation
+    wire [31:0] dc_probe_addr;
+    wire        dc_probe_hit;
+
     lsu_a u_lsa (
         .clock, .reset,
         .flush_valid(flush.valid), .flush_rob(flush.rob), .flush_dtail(co_flush_dtail),
         .ld_valid(co_ld_valid), .ld_req(co_ld_req), .ld_ready(co_ld_ready),
+        .probe_addr(dc_probe_addr), .probe_hit(dc_probe_hit),
         .st_valid(co_st_valid), .st_req(co_st_req), .st_ready(co_st_ready),
         .resp_valid(co_resp_valid), .resp(co_resp), .resp_replay(co_resp_replay),
         .rd_push_valid(la_rd_v), .rd_push_addr(la_rd_addr), .rd_push_idx(la_rd_idx),

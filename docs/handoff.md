@@ -575,3 +575,167 @@ sh verilog/stubs/run_ut.sh tb_lsu   # 亦可 tb_mul/tb_div/tb_stub_link/tb_be_li
 - 探针本窗已全部清零并三步验证。
 - **未 git commit**（等指示）。
 
+### 15.6 追加：M8 综合异常核查 + M8 diff 独立审查（步骤 0）
+
+**(A) 频率 671.92 MHz 的核查（结论：可复现但属 ABC 映射方差，非架构性提速）**
+- 流程完整、确定性：两次 `make synth MODE=opt` 逐位一致（4,270.640 µm² / 1.4883 ns / 671.92 MHz），无 ERROR/latch/Resizing，SRAM 面积/模块树正常（非黑盒）。
+- **隔离实验**：临时把 `iq` 的 store 门槛退回"需 rs1∧rs2 就绪"（lsu_b 的 M8 改动仍在，但此时 `s_dvalid≡1` ⇒ lsu_b 行为与原版等价、新增逻辑退化为常量）→ synth **4,253.159 µm² / 1.6182 ns / 617.98 MHz**。仍是基线（383.66 MHz）的 1.6 倍。⇒ 频率跃升**不来自 iq 放宽**，而来自 **lsu_b 网表扰动**；且被扰动的"功能等价"网表也给出 618 MHz。
+- 对照 §2 先例（同一 RTL 旧流程 93.5 MHz ↔ 新流程 381.8 MHz），结论：**新 ABC（buffering + cell sizing）对网表扰动极敏感，383→672 MHz 是映射方差**。当前提交 RTL 的官方口径值就是 **671.92 MHz**（可复现、按口径有效），但**不可假定它能挺过无关的后续 RTL 改动**——频率加分策略不要押在它稳定上。
+- 已恢复 iq 并重建：`make perf` 仍 **0.7259**。
+
+**(B) M8 diff 独立审查（`iq.sv`/`lsu_b.sv`/`core_ooo.sv`/`cpu_pkg.sv`）——未发现正确性缺陷**
+- 逐项核对：store 数据迟到（`s_ps2`+`s_dvalid`+WB CAM）与 issue 当拍写回（bypass 使 `rs2_ready=1`、值取自总线）无缝隙；`ps2=0`(x0) 恒 `rs2_ready=1`；生产者被杀 ⇒ store 必被杀（生产者更老）⇒ 无孤儿；同拍分配与 CAM 回填不冲突；`stsh` 晚填的 off/f3 用 `s_addr/s_f3`，与分配期一致；前递仅在 `s_dvalid[best]`（全覆写）成立，否则 `blk`（§7.2 规则 2）；drain 门槛、flush kill、`ndone`/提前退役均未变。
+- `make build` 的 7 条 LATCH 告警与 M8 前**逐数相同**（均为 `lsu_b` 前递 `always_comb` 内块局部临时变量，Verilator 良性的假阳性）；**`make synth` 无 latch、无 UNOPTFLAT**。lsu_b 新增的 `wb_a/wb_b` 只用于 `always_ff` 次态，无组合环。
+- 结论：M8 保持合并状态。
+
+---
+
+## §16 新窗口交接（2026-10-17：M8a load 早写回 → M8b 误预测代价 → M9 双发）
+
+> §15 是上一窗（M6+M8）记录；本节是新窗口交接。**路线已按 M6 实测修订，蓝本以 `docs/design.md §16.9` 为准**（M7 TAGE No-Go；M8 已落地）。
+
+### 16.1 当前基线（启动核对数字，任一不符先排干净）
+
+- RTL 状态 = commit `1a855fe`（已推 origin/main）+ 本窗未提交的文档改动（design/impl-plan/handoff）。`cpu_pkg`：`WB_BYPASS=1 / ROB=32 / PRF=64 / IQ=16 / LDQ/STQ=8 / MSHR_N=2 / LINE_BYTES=32 / DC_LINES=1024 / BHT=256 / BTB=128 / RAS=16 / BP_GHR_BITS=8`；`issue_t` 新增 `rs2_ready`（M8）。
+- `make test SIM=build/sim MAX_CYCLES=20000000` 应 **19/19**：tak=**1,250,250**、qsort=**1,269,616**、pi=**15,609,411**、queens=**446,416**；其余：magic 624,034 / bulgarian 356,233 / basicopt1 208,371 / hanoi 5,793 / superloop 537,110 / multiarray 1,954 / statement_test 1,212 / add_to_100 459 / array_test1 451 / array_test2 499 / expr 575 / gcd 401 / lvalue2 232 / manyarguments 263 / naive 216。
+- `sh build/run_all_ut.sh` 应 **6/6**（`tb_stub_link` 打 "[tb_stub_link] ok:"，无 %Error 即过）。
+- `make perf SIM=build/sim MAX_CYCLES=20000000` 应 **GEOMEAN=0.7259**（median 10,833/0.6426、multiply 24,222/0.8968、qsort 293,199/0.4772、rsort 176,713/1.1076、towers 9,343/0.5649、vvadd 5,321/0.8502）。
+- `make synth MODE=opt` 应无 ERROR/latch/Resizing（**≈4,270.6 µm² / ≈1.4883 ns / ≈671.9 MHz**；留档 `references/synth-history/2026-10-16-newflow-m8-storeaddr-opt.json`。**注意 ABC 映射方差**：功能等价网表可差 383↔618↔672 MHz（§15.6A），勿把 672 当稳定资产，护栏按 ≥320 计）。
+- LATENCY 口径备查：L=1 GEOMEAN **0.8470**、L=50 **0.4146**（perf 12/12 PASS；tak/queens/qsort/hanoi correctness 子集 L1/L50 全 PASS）。
+- golden 基线：qsort 已提交 load **31,033**、rsort **37,902**，均 0 mismatch（§15.4）。
+
+### 16.2 新窗口任务（按序；机制/门以 design §16.9 为准）
+
+0. **启动核对**（§16.1）。
+1. **复测探针（~半天，当天清零三步验证）**：post-M8 重跑 P2（同拍双就绪 load + 同 bank 冲突）与 P4（load-use 占比——**必须用 LDQ 派生的在飞 load 掩码**（lsu_b 输出 dbg 位图→iq 输入），不能在 IQ 本地记账：被杀 load 永不写回 → 位泄漏 → 指标退化为 100%）；**新增 P5**（同线 guard：被堵 load 中"仅同线、无重叠"的拍数与占比——决定 M9c 是否做）与 **P6**（误预测代价：BRU 解析拍 → 正确路径首条指令发射拍的直方图——校准 M8b 收益）。探针一律 `$fopen/$fwrite` 到 `build/dbg_probe.log`，**每次 `$fwrite` 后 `$fflush`**（多句柄写同一文件会撕裂行，本窗踩过），绝不污染 stdout。
+2. **M8a：load 早写回（消 2 拍 load-use）——本窗第一优先**。现路径：D$ resp 拍 T → `l_st/l_data` 寄存 → `wb_hv` 保持寄存 → **T+2 上 BB** → 消费者 T+2 发射（WB_BYPASS）。改：resp（及 store 前递 `sc_fwd/f_data`）完成拍**组合直通 BB**。要点：`wb_hv` 保留为同拍双完成（resp+前递）兜底与仲裁败者路径；早写回**同拍释放 LDQ 项**（恰好一次，防双写回/漏写回）；kill 过滤沿用 `l_valid∧SENT∧rob 匹配`（被杀 load 的早写回会被 ROB 过滤成 reclaim，语义同 §5C-1，需复核 tag-0 分支）；BB 优先级 early-LSU > hold-LSU > MUL > ALU1（`alu1_grant` 等连带）；M8 的 store 数据回填走 `bb_ok`，自动提前 2 拍。**不改访存数值语义**（golden 应仍 0 mismatch）。门 **GA：GEOMEAN ≥0.78**（预期 ~0.79）。验收：全量回归 + golden（qsort/rsort）+ LATENCY=1/50 + synth 留档（新组合路径 D$resp→ldext→BB→IQ CAM 可能成为关键路径，护栏 ≥320）。
+3. **M8b：误预测代价 −1 拍**。flush/kill 广播**不动**（§4.3 寄存 1 拍是全链不变式）；仅把 **FE 的 pc 重定向提前到 BRU 解析拍**（组合送 target）；解析拍~广播拍之间取到的错路径块当拍丢弃（push 抑制一拍）；`bsf` 一致性与 IFB 截断重证（fetch_unit 头注释 + §5D-9 必读）。门 **GB：≥0.80**。
+4. **M9：双发 LSU + 双读 D$**（§16.5/§16.9）：D$ 数据 bank 复制双份（写双副本，SRAM +≈1.4k µm²）、同 bank（同 word 索引）冲突 replay、`MSHR_N→4` 且每 set 2 项、IQ 每拍 ≤2 LSU（**最老优先**，沿用 `lsu_sel` 教训）、store 仍严格程序序。门 **GC：≥0.84 且频率 ≥320 MHz**。访存内核级改动：全量 golden + flush 压测 + LATENCY=1/50 缺一不可。
+5. **M9c（门控）**：同线 guard 放宽——仅当 P5 显示占比大；只有 load **miss** 分配路径存在竞态（hit 不需要 guard），需把 guard 挪到 A 侧或传 hit/miss，并重证 §7.2 注的失效竞态。
+6. 每步：`make test`（20M）+ `run_all_ut.sh` + `make perf` 六项 + `make synth MODE=opt` 冒烟留档 `references/synth-history/`；改动累积后展示 diff 摘要等指示，**不随手 commit**。
+
+### 16.3 本窗新增陷阱合订（在 §5/§13.5/§14.3 之外）
+
+1. **ABC 频率映射方差（§15.6A）**：新流程下功能等价网表可差 383↔618↔672 MHz；频率数字只作当次留档口径，**不要**作为可依赖资产或优化目标（护栏 ≥320 计）。
+2. **探针多句柄写同一文件会撕裂行**：不同模块各自 `$fopen("...","a")` 的缓冲区会在 flush 时交错；**每次 `$fwrite` 后 `$fflush`**，或每模块独立文件。
+3. **"在飞 load 集合"必须从 LDQ 派生**（lsu_b 组合输出位图→iq 探针输入）：IQ 本地按"dispatch 置位/WB 清零"记账会被"被杀 load 永不写回"泄漏污染（本窗实测退化为 zerodep_load==zerodep）。
+4. **§14.1 的 correctness 周期数已被 §15.1 修正**（§13.6 GHR 恢复清理晚于该数字；两版 perf 全等）。新窗口一律以 §16.1 数字对表。
+5. **Verilator 7 条 LATCH 告警为良性假阳性**（`lsu_b` 前递 `always_comb` 块内局部临时变量，M8 前后逐数相同）；判据以 `make synth` 无 latch 为准。
+6. **M8 不变式（动 `lsu_b`/`iq` 前必背）**：store 仅 rs1 就绪即发射（数据可后到）；STQ `s_dvalid/s_ps2/s_f3` + `ba_ok/bb_ok` CAM 回填；drain=退役∧`s_dvalid`；前递仅 `s_dvalid[best]` 且全覆盖，否则 §7.2 规则 2 阻塞；load 门槛="早于最老未发射 store"（单 LSU+最老优先下等价于"早于最老地址未知 store"）。
+7. `iq.sv` 的 `bix_q` 仍是字面量 `[9:0]`（bix 实为 8b 派生）：BHT=256 下无害；若未来 BHT>1024 需全链改派生（M7 已 No-Go，低优先）。
+8. **不要用字符串脚本批量改 `verilog/memory/lsu_b.sv`**（本窗曾因 python 替换误操作致文件重复损坏，靠字节级重建恢复；一律用编辑工具逐处改）。
+
+### 16.4 工具/口径备忘
+
+- **golden 重生成（已验证逐行一致）**：`python3 tools/rv32golden.py testcases/perf_qsort/program.data 200000 --ld > build/win2_qsort_golden_ld.txt`（rsort 同理；现存量 qsort 31,033 LD / 13,750 ST）。`build/` 被 gitignore，`make clean` 后须重生成。
+- 提交级对拍：`python3 build/win2_analyze_commit.py build/dbg_probe.log build/win2_qsort_golden_ld.txt`（探针行格式 `TAG <cyc> key=val...`，即**周期是裸 token**，不是 `cyc=N`；探针在 rob（DSP/CMT/RWB）与 lsu_b（LF/LV/FWD/STACC），写法可参考 §15.4 的实现记录）。
+- 分支流离线模型：`build/m6_branch_model.py`（bimodal/gshare/锦标赛/TAGE/oracle；输入 P1 的 `B pc tk pt mis` 提交流）。M7 已 No-Go，仅存档用。
+- 单例跑法/参数扫描/逐周期不变证明：见 §7/§8；`make synth` 会清 `build/sim`，synth 后先 `make build`。
+
+### 16.5 新窗口启动提示词（直接复制）
+
+```
+继续 RISC-V CPU 的实现（阶段 2 冲刺）。M6 测量与 M8（store 地址早知）已完成：IPC GEOMEAN 0.7259 / 面积 4,270.6 µm² / 671.92 MHz（注意：频率含 ABC 映射方差，勿当稳定资产，见 handoff §15.6A）。本窗口目标：按 docs/design.md §16.9 修订路线冲 IPC——第一优先 M8a「load 结果响应拍直通 BB（消 2 拍 load-use）」，其次 M8b「误预测代价 −1 拍」，再 M9「双发 LSU + 双读 D$」，目标 GEOMEAN ≥0.8450（阶段 2：面积 ≤18,000 µm²、频率 ≥300 MHz，护栏 ≥320）。先测量后动手。
+
+先按顺序完整读完五份文档再动任何代码：
+1) docs/handoff.md（§15 上一窗记录、§16 本节、§5 全部陷阱、§9/§14.4 纪律）；
+2) docs/design.md（§2 框架硬约束、§4.3 flush 协议、§4.4 写回总线、§5 前端与 BP、§6 后端、§7 AXI/边界与访存、§16 阶段 2（§16.9 修订路线优先）；
+3) docs/impl-plan.md（§13 排程 + 修订指引）；
+4) docs/axi4-lite.md；
+5) references/synth-history/2026-10-16-notes.md（§11/§12；面积/频率以新流程留档为准）。
+
+启动核对（数字对表，任一不符先排干净）：make test SIM=build/sim MAX_CYCLES=20000000 应 19/19（tak=1,250,250、qsort=1,269,616、pi=15,609,411、queens=446,416）；sh build/run_all_ut.sh 应 6/6（tb_stub_link 无 %Error 即过）；make perf SIM=build/sim MAX_CYCLES=20000000 应 GEOMEAN=0.7259（median 10,833 / multiply 24,222 / qsort 293,199 / rsort 176,713 / towers 9,343 / vvadd 5,321）；make synth MODE=opt 无 ERROR/latch/Resizing（≈4,270.6 µm² / ≈1.488 ns / ≈672 MHz）。注意：make synth 会清 build/sim，synth 后先 make build 再跑 test/perf。
+
+任务（按序，详见 handoff §16.2 / design §16.9）：
+1. 复测探针（~半天，当天清零三步验证）：post-M8 重跑 P2/P4（P4 的在飞 load 集合必须从 LDQ 派生，不能在 IQ 本地记账）；新增 P5（同线 guard 无重叠阻塞占比）与 P6（误预测代价直方图）。探针一律 $fopen/$fwrite 到 build/dbg_probe.log 且每次 $fwrite 后 $fflush，绝不污染 stdout。
+2. M8a：lsu_b 的 load 完成（D$ resp 与 store 前递）在完成拍组合直通 BB，消 2 拍 load-use；wb_hv 保留兜底（同拍双完成仲裁）；早写回同拍释放 LDQ（恰好一次）；kill 过滤沿用 l_valid∧SENT∧rob 匹配；BB 优先级 early-LSU > hold-LSU > MUL > ALU1；不改访存数值语义。门 GA：GEOMEAN ≥0.78。验收：make test + UT + make perf + 提交级 golden（qsort/rsort，应仍 0 mismatch）+ LATENCY=1/50 + synth 留档（新组合路径注意频率护栏）。
+3. M8b：误预测代价 −1 拍（FE pc 重定向提前到 BRU 解析拍；flush/kill 广播协议 §4.3 不变；错路径块当拍丢弃；bsf/IFB 截断重证）。门 GB：≥0.80。
+4. M9：双发 LSU + 双读 D$（D$ bank 复制双副本写双份；同 bank=同 word 索引冲突 replay；MSHR_N→4 且每 set 2 项；store 仍严格程序序；IQ 每拍 ≤2 LSU 且最老优先）。门 GC：≥0.84 且频率 ≥320 MHz。全量 golden + flush 压测 + LATENCY=1/50。
+5. 每步：make test（20M）+ run_all_ut.sh + make perf 六项 + make synth MODE=opt 冒烟留档 references/synth-history/；改动累积后展示 diff 摘要等指示，不随手 commit。
+
+已知必读陷阱：handoff §5 全部 + §13.5/§14.3 + §15.6/§16.3 新增（gshare 一致性铁律；IQ 轮转非按年龄须显式最老优先；端口宽度与 cpu_pkg 派生一致否则 Yosys Resizing；make synth 清 build/sim；结构体加字段 stub 赋值模式要补；ABC 频率映射方差；探针多句柄写同一文件须 $fflush；M8 不变式——store 仅 rs1 发射、数据经 ba_ok/bb_ok CAM 回填、drain=退役∧dvalid、前递仅 dvalid）。
+
+工程纪律：RTL 禁 $display（探针除外且当天清）；回归一律 MAX_CYCLES=20000000；cpu_pkg 只增不删、改前说明；scripts/ 只读；行为等价改动先证默认逐周期不变；行为变更需说明并全量回归，访存语义变更必须提交级 golden 对拍（golden 丢失时用 tools/rv32golden.py 重生成，命令见 handoff §16.4）；不随手 commit。
+```
+
+---
+
+## §17 本窗（2026-10-17 第二窗）：M6b 复测 + M8a load 早写回 + M8b 误预测早重定向 + M9c 同线 guard 放宽；M9 判定 No-Go
+
+> 口径：`make test/perf SIM=build/sim MAX_CYCLES=20000000`；综合 `make synth MODE=opt`（新流程）。启动核对与 §16.1 **逐项完全一致**（19/19、UT 6/6、GEOMEAN 0.7259、4,270.640 µm² / 1.4883 ns / 671.92 MHz）。
+
+### 17.1 结论先行
+
+- **GEOMEAN 0.7259 → 0.9348**（M8a +6.0%、M8b +1.6%、**M9c +14.4%**）。**GA（≥0.78）/ GB（≥0.80）/ GC（≥0.84）全过，且越过阶段 2 的 G4 目标 0.845（0.9348 ≥ 0.845）**。
+- 全量：`make test` **19/19**、UT **6/6**、`make perf` 6/6 **GEOMEAN 0.9348**；LATENCY=1 GEOMEAN **1.0235** / LATENCY=50 **0.5638**；flush 压测 tak/queens/qsort/hanoi 在 L=1/50 全 PASS。
+- **提交级 golden**（`win2_analyze_commit.py`，M8a/M8b/M9c 各跑一轮）：qsort 已提交 load **31,033/31,033、0 mismatch**、store 0 mismatch、无 LV/无 RWB=0；rsort **37,902/37,902、0 mismatch**、store 0 mismatch。
+- synth（均无 ERROR/latch/Resizing）：M8a **4,103.6 µm² / 605.56 MHz**、M8b **4,082.7 µm² / 600.59 MHz**、**M9c 4,091.8 µm² / 605.20 MHz**（留档 `2026-10-17-m8a-*`、`-m8b-*`、`-m9c-*`）。频率含 ABC 方差警示，护栏以 ≥320 MHz 计。
+- **M9（双发 LSU + 双读 D$）：判定 No-Go，未实施**（论证见 §17.4）——由 **M9c 以低得多的代价取得更大收益**（+14.4% vs M9 预估 +9%）。
+- RTL 改动 5 文件：`memory/lsu_b.sv`（M8a + M9c）、`backend/core_ooo.sv` + `student_top.sv`（M8b + M9c 连线）、`memory/lsu_a.sv` + `memory/dcache.sv`（M9c）。**未 git commit**。
+
+
+### 17.2 M6b 复测探针（临时，已清零三步验证）
+
+探针：lsu_b P2（同拍 ≥2 条 D$ 可发 load + 同 word bank 冲突）、P5（被堵 load 中"仅同线、无字节重叠"）、IQ P4（依赖 stall 中在飞 load 占比，**在飞集合由 lsu_b 的 LDQ 位图派生**，非 IQ 本地记账）、core_ooo P6（BRU 解析拍→下一次发射的直方图）。一律 `$fopen/$fwrite` → `build/dbg_probe.log`，每次写后 `$fflush`。清零验证：全树 `$display/$fopen/$fwrite` 归零 + 重建 + 6 项 perf 逐周期与带探针时全等（0.8170 前后一致）。原始结果：`build/m6b_probe_results.txt`。
+
+| 用例 | cyc | dual_go | samebank/dual | P5blk 占比 | P5sl 占比 | zdep | zdep_load | onlyload | mis | 平均代价 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| median | 10,832 | 47.0% | 6.3% | 0 | 0 | 2,405 | 2,405 | 2,403 | 305 | 3.30 |
+| multiply | 24,221 | 3.5% | 5.7% | 0 | 0 | 595 | 595 | 398 | 677 | 4.05 |
+| qsort | 293,198 | 11.0% | 12.2% | 52.2% | 52.0% | 83,110 | 83,108 | 79,812 | 13,151 | 3.52 |
+| rsort | 176,712 | 22.0% | 9.6% | 23.6% | 23.4% | 43,072 | 39,549 | 7,577 | 32 | 5.56 |
+| towers | 9,342 | 16.4% | 2.0% | 43.0% | 43.0% | 3,795 | 3,222 | 1,019 | 71 | 5.63 |
+| vvadd | 5,320 | 94.0% | 0% | 0 | 0 | 2,210 | 2,210 | 2,210 | 7 | 10.0 |
+
+- **P5 是最大新发现**：qsort/rsort/towers 的"被堵 load"几乎**全部只被同线 guard 挡住（无字节重叠）**（qsort 52.0% 周期、rsort 23.4%、towers 43.0%）→ **M9c（同线 guard 放宽）是比 M9 更有据的下一步**（须重证 §7.2 注的失效竞态，只有 miss 分配路径有竞态）。
+- P6：误预测代价以 **4 拍为主桶**（median/multiply/qsort 的 h4 占绝大多数）→ M8b 削 1 拍按键值。
+
+### 17.3 M8a（load 结果响应拍直通 BB）+ M8b（FE 早重定向）
+
+- **M8a（`memory/lsu_b.sv`，唯一改动文件）**：load 完成（D$ resp 与 store 前递）**在完成拍组合直通 BB**；`wb_hv` 保留为同拍双完成兜底（early 优先于 hold，`wb_grant` 仅在 hold 被呈现时清除）；早写回**同拍释放 LDQ**（`l_valid<=0`，恰好一次）；kill 过滤沿用 `l_valid∧SENT∧rob 匹配`（treat as §5C-1）。**并额外消除 load 发射的强制锁存拍**：新选中（未锁存）的 load 当拍组合呈现 D$，端口即刻接受则直接 SENT、端口忙才锁存（payload 稳定不变）——这一项贡献最大（0.7571→0.8044）。不改访存数值语义（golden 0 mismatch）。0.7259→**0.8044**（median −15.2%、vvadd −14.6%、qsort −12.8%、tak −9.7%）。
+- **M8b（`core_ooo.sv` + `student_top.sv`）**：core_ooo 增加组合早重定向输出 `redir_valid/pc/bsf`（= BRU 解析拍 `b_i∧b_mispred` 的 target）；student_top 组装 `fe_flush`（registered `flush` 的字段 + 早 valid/pc/bsf）**只喂 fetch_unit**，后端仍用寄存 1 拍的 `flush`（§4.3 协议不变）。**fetch_unit 一字未改**：即"FE 的 flush 整体提前 1 拍"，`pc_r` 早一拍重启、当拍丢弃错路径块、`bsf`/IFB 截断时序沿原逻辑。0.8044→**0.8170**（median −3.0%、multiply −2.8%、qsort −3.1%）。
+  - **踩坑**：先按"仅提前 pc 重定向 + 在 flush 寄存拍仍允许发射"实现 → median 错答案（`result=4`）。根因：FE 与后端 flush 一拍错位（早重定向必须与 FE 的 flush 同拍整体生效）。改为"整体提前 FE 的 flush"后正确。**教训：FE 的 flush 语义是个整体，不能只搬 pc 一项。**
+
+### 17.4 M9（双发 LSU + 双读 D$）判定：No-Go（未实施）
+
+用本窗 M8a 的诊断探针（`LS cyc/…`）量化 **load 需求 vs D$ 端口容量**：
+
+- **load 完成率 ≈ 0.14~0.35 条/周期**（median：resp 2,076 / 8,909 cyc ≈ 0.23；qsort：35,326/247,766 ≈ 0.14；vvadd：1,200/4,543 ≈ 0.26），而 D$ 单读口容量 **1 条/周期** → D$ 端口**远未饱和**（呈现 `go` 亦仅占 median 35% 周期）。
+- **LSU 只有 1 条 BB 结果总线**，load 完成上限本就 **1 条/周期**；M8a 后 `hold`（DONE 等 WB）≈ 0（median/qsort 几乎不排队）→ **WB 侧无积压**。即使 D$ 双读把响应提到 2 条/周期，WB 也只能 1 条/周期 → **结构上无法提速**（除非再加第 2 条 LSU WB 总线，而 §16.5/§16.9 未规划）。
+- P2 的 `dual_go`（同拍 ≥2 条就绪 load）只说明"偶发争用发射口"，不代表端口是稳态瓶颈（P4/Q 见 §17.2 的绝对完成率）。
+
+结论：**M9 在本基线（WB 单总线 + load 需求 ≪1/周期）预期收益近零，且改动横跨 iq/lsu_a/lsu_b/dcache（访存内核）风险极高**；按 §16.7 的 Go/No-Go 精神（对照 M7 No-Go 先例）**跳过实施**。剩余最有据的杠杆是 **M9c 同线 guard 放宽**（§17.2 P5）。
+
+### 17.5 M9c（同线 guard 放宽）—— 已实施，本窗最大贡献
+
+**依据**：§17.2 P5（qsort 52% / towers 43% / rsort 23% 周期被"仅同线、无字节重叠"的 guard 堵住）。
+
+**机制（安全性论证）**：guard 只为防 **load miss 分配路径**的"store 完成失效 vs 回填"竞态；**load 命中不分配、无竞态**。故放宽条件 = **"该 load 的 D$ 行当拍命中"**：
+- `dcache` 新增组合 **tag 探针** `probe_addr→probe_hit`（`v_q[set] && tag_q[set]==tag`，纯读 tag/valid flop 阵列，无副作用）。
+- `lsu_b` 保留原 guard 逻辑，但对"**仅被同线 guard 堵住**的最老者"（`sl_any && !blk_ov && !f_fwd`，程序序最老，每拍 1 条）查询探针；命中则放行（`f_go=1`）。
+- **证明（无分配即无竞态）**：探针命中（A 拍行有效）→ A+1 拍 lookup 若命中则安全（L 的字不与任何更老 store 重叠，其字节来自更早的完成回填）；若 A+1 拍变 miss，只可能因（a）store B 完成失效（该 store 已写穿 AXI → 回填取到新值，安全）或（b）同 set 新 MSHR 分配（`set_busy=1` → 该 load replay、不分配，安全）。故探针命中是充分条件。
+- 探针/连线路径：`lsu_b.probe_addr → core_ooo → student_top → lsu_a → dcache.probe_hit`（`mem_req_t` 未改，独立侧带）。
+
+**收益**：0.8170 → **0.9348**（+14.4%）：**qsort 247,766→158,303（−36.1%）**、towers 8,710→6,942（−20.3%）、rsort 164,305→143,858（−12.5%）；median/multiply/vvadd 逐周期不变（P5=0，行为等价）。**提交级 golden qsort/rsort 仍 0 mismatch**；synth 4,091.8 µm² / 605.20 MHz（探针 1024 项 tag mux 未成关键路径）。
+
+### 17.6 下一步（按优先级）
+
+1. **阶段 2 的 G4（≥0.845）已由 M9c 越过（0.9348）**。剩余可选：冲**阶段 3**（面积 ≤36,000、IPC ≥1.0985、频率 ≥400/500）或加固收口。
+2. 若继续提 IPC：M9c 只放宽了"同线命中"；可评估 (a) 更激进的多同线候选探针（当前每拍只探最老 1 条）、(b) M10 门控项（3 发射/更宽 WB）、(c) MSHR/流式（vvadd 仍 0.996 已近满）。
+3. 若冲频率：本题 RTL 综合口径频率受 ABC 方差影响大（§15.6A），建议先 `MODE=diagnose` 定位、再结构化。
+4. 全量回归 + golden + synth 后收口；**仍未 git commit**（等指示）。
+
+### 17.7 本窗 diff 摘要
+
+```
+verilog/backend/core_ooo.sv   | M8b redir 输出 + M9c probe 连线
+verilog/memory/lsu_b.sv       | M8a 早写回/零锁存 + M9c guard 放宽
+verilog/memory/dcache.sv      | M9c tag 探针 (probe_addr/probe_hit)
+verilog/memory/lsu_a.sv       | M9c probe 透传
+verilog/student_top.sv        | M8b fe_flush + M9c probe 连线
+docs/{handoff,design,impl-plan}.md | 文档更新（§17）
+```
+`rob.sv`/`fetch_unit.sv`/`cpu_pkg.sv` 无净改动；全树 `$display/$fopen` 0 处（探针已清）；3 个 synth JSON/timing.rpt 留档。
+
+
+

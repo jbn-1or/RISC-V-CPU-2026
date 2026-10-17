@@ -701,12 +701,22 @@ GEOMEAN=0.845 等价于六项 IPC 乘积 ≈0.364，差距按对数均摊：
 
 ### 16.3 M7：TAGE 方向预测（`frontend/bp.sv`）
 
+> **【2026-10-17 状态：No-Go，未实施】** M6/P1 实测（handoff §15.2）：qsort 条件分支方向**不可约**（bimodal 24.47% 已优于一切历史预测器，全部 TAGE 变体 ≥25%，机器现值 27.37%），G1 的"qsort 误预测 ≤16%"**结构上不可达**；且 TAGE 均值不优于现有锦标赛（13.27%）。按 §16.7 压缩投入直推 M8。本节保留为历史设计，**勿按此实施**；离线模型与 trace 见 `build/m6_branch_model.py`（build/ 不入库，可重写）。
+
 - 结构：base bimodal（沿用 `bht_b`）+ 3 张 tagged 历史表（GHR 8/24/64 折叠索引）+ 8~9b tag + 2b ctr + useful 位；最长匹配胜出；useful 位控制分配/失效。
 - **一致性铁律**（本仓实测教训：不一致使 qsort 误预测 24.8%→38.6%）：预测与训练必须同一索引 ⇒ 携带字段由 `bix`（8b，gshare 索引）扩为 `{命中表号, 各表索引}`（≈30~40b，`fe2rn_t/renamed_t/issue_t` 只增）；GHR 扩到 64b。
 - flush 恢复：沿用"由携带索引重建低 GHR 位 + 实际结果移位（条件分支）/不移位（JALR）"机制；**长历史表允许部分失真**，由 useful 位自愈（不追求完美检查点）。
 - 验收：`tb_bp` 重写；误预测率探针复核；门 **G1：GEOMEAN ≥0.67 且 qsort 误预测 ≤16%、towers ≤20%**。
 
 ### 16.4 M8：访存乱序（store 地址早知；**无投机版本**）
+
+> **【2026-10-17 状态：已实施并通过 G2（GEOMEAN 0.6489→0.7259）**，全量验收与记录见 handoff §15.4】。as-built 与本节的差异：
+> ① ROB done 时机二选一取了"**AGU（发射拍）即 done**"（提前退役安全性论证不变：store 无寄存器结果，内存副作用由 STQ 退役后 FIFO drain 保证）；
+> ② 携带字段落在 `issue_t.rs2_ready`（cpu_pkg 只增）而非 renamed_t，ps2 复用 issue_t 既有字段；
+> ③ 数据回填用**合格写回总线 `ba_ok/bb_ok`** 的 STQ CAM（匹配 `s_ps2` → `s_data=stsh(wb.result)`、`s_dvalid=1`）；
+> ④ drain 门槛 = 退役 ∧ `s_dvalid`；前递仅在 `s_dvalid[best]` 且全字节覆盖时成立，否则按 §7.2 规则 2 阻塞；
+> ⑤ `same-line 守卫`（第 4 点）**未收窄**（保持原样，留作 M9c 门控项）；
+> ⑥ load 门槛未再放宽（单 LSU + 最老优先下，"早于最老未发射 store"与"早于最老地址未知 store"等价——store 地址就绪即发）。
 
 机制（全部可证保序，不引入违规重放）：
 1. **IQ（§6.3 修订）**：store 项**仅 rs1（地址）就绪即可发射**（rs2 数据未就绪不阻塞发射）；携带 `ps2` 到 LSU。
@@ -752,3 +762,24 @@ GEOMEAN=0.845 等价于六项 IPC 乘积 ≈0.364，差距按对数均摊：
 
 - 新参数：`BP_TAGE_*`（表数/基础历史/历史步进/tag 宽）等；`MSHR_N` 值变更 2→4；携带字段 `bix` 扩宽为 TAGE 索引组。
 - 一切新字段/新参数先改 `cpu_pkg`（PR 双审纪律），随后**全链透传并全树 grep 窄连线**（端口宽度一律与 `cpu_pkg` 派生一致，防 Yosys `Resizing cell port`）。
+  > 2026-10-17 注：`BP_TAGE_*` 与 `bix` 扩宽随 M7 No-Go 一并搁置；`MSHR_N 2→4` 移入 M9。
+
+### 16.9 v1.2 路线修订（2026-10-17：M6 实测 + M8 落地后；**本节优先级高于 §16.5/§16.6 的排序**）
+
+> 基线：GEOMEAN **0.7259** / **4,270.6 µm²** / **671.92 MHz**（频率含 ABC 映射方差警示：功能等价网表可差 383↔618↔672 MHz，见 handoff §15.6A；护栏以 ≥320 MHz 计，勿把 672 当稳定资产）。
+> 依据（M6 四探针，handoff §15.2）：① 分支方向不可约（M7 No-Go，§16.3）；② store 侧阻塞已被 M8 收割（rsort −26.9%、vvadd −22.4%）；③ 剩余大头 = **load 侧延迟**（每条 load→use 固定 +2 拍，P4 纯 load-use：median 82.5%/multiply 66.9%/qsort 42.7% 的 zerodep 拍）、**误预测代价**（qsort ~16k 次 × 代价拍）、**LSU 单口宽度**（P2 双就绪拍：vvadd 42.7%/median 41.3%/rsort 15.5%）。
+
+**修订后里程碑（按序）**：
+
+| 里程碑 | 机制 | 依据/预估 | 门 |
+|---|---|---|---|
+| **M8a（新，第一位）：load 早写回** | 现路径：D$ resp 拍 T → `l_st/l_data` 寄存 → `wb_hv` 保持寄存 → **T+2 才上 BB** → 消费者（WB_BYPASS）T+2 发射。改为 **resp（及 store 前递）完成拍组合直通 BB**，省 2 拍/条。要点：`wb_hv` 保留为同拍双完成（resp+前递）兜底；早写回**同拍释放 LDQ**（恰好一次，防双写回）；kill 过滤沿用 `l_valid∧SENT∧rob 匹配`（被杀 load 的早写回走 ROB 过滤/reclaim，语义同 §5C-1）；BB 优先级 early-LSU > hold-LSU > MUL > ALU1；M8 store 数据回填走 `bb_ok` 自动提前 2 拍（协同） | P4；qsort −8% / median −15% / vvadd −20% / multiply −3% → GEOMEAN ≈ +9% | **GA ≥0.78** |
+| **M8b：误预测代价 −1 拍** | flush 仍按 §4.3 寄存 1 拍广播（协议不变）；**仅 FE 的 pc 重定向提前到 BRU 解析拍**（组合送 target，pc_r 早一拍重启）；解析拍→广播拍之间取到的错路径块当拍丢弃（push 抑制一拍）；`bsf`/IFB 截断时序重证 | qsort 16k 次 ×1 拍 = −5.5%、median −4.4%、multiply −5.2% → ≈ +3% | **GB ≥0.80** |
+| **M9：双发 LSU + 双读 D$** | §16.5 原案 + as-built 注：D$ 数据 bank **复制双份**（每 bank 两份 SRAM，写双副本；SRAM +≈1.4k µm²）；同 bank（= 同 word 索引）冲突一方 replay；`MSHR_N→4` 且每 set 2 项；store 仍严格程序序；IQ 每拍 ≤2 LSU（最老优先沿用 `lsu_sel` 教训） | P2：同 bank 硬冲突仅占可双发拍 0~13%；vvadd/rsort/median 为主 → ≈ +9% | **GC ≥0.84 且频率 ≥320 MHz** |
+| **M9c（门控）：同线 guard 放宽** | 仅当复测 P5 显示"同线无重叠"阻塞占比大才做：**load 命中路径不需要 guard**（无重叠字节本就正确），只有 miss 分配路径存在"store 完成失效 vs load 回填"竞态（§7.2 注）；实现需把 guard 挪到 A 侧或向 lsu_b 传 hit/miss | 待 P5 测量 | 无独立门（并入 G4） |
+
+> **【2026-10-17 第二窗状态】** M8a 已实施（0.7259→0.8044）、M8b 已实施（→0.8170）；**M9c 已实施（→0.9348）**——GA/GB/GC 全过，**阶段 2 的 G4（≥0.845）已越过**。**M9 判定 No-Go 未实施**：M8a 探针实测 load 完成率 ≈0.14~0.26 条/周期（远低于单读口容量 1/cycle），且 LSU 仅 1 条 BB 结果总线、`hold`≈0（WB 无积压）——端口非稳态瓶颈，无第 2 条 WB 总线时 M9 结构性难提速（对照 M7 No-Go 先例）；改由 **M9c 同线 guard 放宽** 以低代价取更大收益。**M9c 机制**：D$ 组合 tag 探针（`probe_addr→probe_hit`），对"仅被同线 guard 堵住"的最老 load，若其行命中则放行（命中不分配→无失效竞态，正证见 handoff §17.5）。详见 handoff §17。
+
+- **G4（≥0.845）与降级路线（§16.7）不变**。
+- M8a/M8b **不改访存数值语义**（golden 应保持 0 mismatch）；M9 动访存内核，须全量 golden + flush 压测 + LATENCY=1/50。
+- 排程同步：impl-plan §13 末尾已加修订指引；交接细节与启动数字见 handoff §16。

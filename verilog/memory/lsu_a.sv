@@ -25,6 +25,10 @@ module lsu_a (
     input  cpu_pkg::mem_req_t ld_req,
     output wire        ld_ready,
 
+    // ---- M9c: D$ tag probe for the same-line guard relaxation ----
+    input  wire [31:0] probe_addr,
+    output wire        probe_hit,
+
     // ---- B side: store drain ----
     input  wire        st_valid,
     input  cpu_pkg::mem_req_t st_req,
@@ -67,6 +71,7 @@ module lsu_a (
         .clock, .reset,
         .lk_valid(ld_valid), .lk_addr(ld_req.addr), .lk_token(ld_req.rob),
         .lk_ready(dc_lk_ready),
+        .probe_addr(probe_addr), .probe_hit(probe_hit),
         .rsp_valid(dc_rsp_valid), .rsp_token(dc_rsp_token), .rsp_data(dc_rsp_data),
         .rsp_replay(dc_rsp_replay), .rsp_ready(dc_rsp_sel_q),
         .su_valid(su_valid), .su_addr(su_addr), .su_data(su_data), .su_strb(su_strb),

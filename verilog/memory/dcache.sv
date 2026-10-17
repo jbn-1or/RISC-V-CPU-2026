@@ -24,6 +24,12 @@ module dcache (
     input  wire [RB-1:0] lk_token,
     output wire        lk_ready,
 
+    // M9c: combinational tag probe used by lsu_b to relax the same-line guard
+    // for loads that would HIT (a hit never allocates, so the stale-fill race
+    // cannot occur). Purely a read of the tag/valid flop arrays.
+    input  wire [31:0] probe_addr,
+    output wire        probe_hit,
+
     // load response: data ready (hit or keyword) or a retry request
     output wire        rsp_valid,
     output wire [RB-1:0] rsp_token,
@@ -85,6 +91,10 @@ module dcache (
     // ---------------- tag / valid arrays ----------------
     logic [cpu_pkg::DC_LINES-1:0] v_q;
     logic [TAGB-1:0] tag_q [0:cpu_pkg::DC_LINES-1];
+
+    // M9c: combinationally probe whether probe_addr currently hits.
+    assign probe_hit = v_q[probe_addr[SETB+OFFB-1:OFFB]] &&
+                       (tag_q[probe_addr[SETB+OFFB-1:OFFB]] == probe_addr[31:SETB+OFFB]);
 
     // ---------------- lookup pipeline (1-cycle SRAM read) ----------------
     logic            pend_q;

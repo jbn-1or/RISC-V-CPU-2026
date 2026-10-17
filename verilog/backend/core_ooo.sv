@@ -16,6 +16,14 @@ module core_ooo (
     output cpu_pkg::flush_t flush_out,
     output wire [$clog2(cpu_pkg::ROB_DEPTH):0] flush_dtail_out,
 
+    // ---- M8b: combinational early redirect to the frontend ----
+    // Asserted in the BRU resolve cycle (one cycle before flush_out.valid),
+    // so the fetch unit can restart at the correct target a cycle earlier. The
+    // registered flush_out still drives the ROB/IQ/LSU kill unchanged.
+    output logic        redir_valid,
+    output logic [31:0] redir_pc,
+    output logic [5:0]  redir_bsf,
+
     // ---- branch resolution feedback (BHT training) ----
     output logic        br_upd_valid,
     output logic [31:0] br_upd_pc,
@@ -38,6 +46,10 @@ module core_ooo (
     input  wire        resp_valid,
     input  cpu_pkg::mem_resp_t resp,
     input  wire        resp_replay,
+
+    // ---- M9c: D$ tag probe for the same-line guard relaxation ----
+    output wire [31:0] probe_addr,
+    input  wire        probe_hit,
 );
     localparam int PB_C = $clog2(cpu_pkg::PRF_NUM);   // physical tag bits
     localparam int RB_C = $clog2(cpu_pkg::ROB_DEPTH); // rob index bits
@@ -295,6 +307,12 @@ module core_ooo (
         end
     end
 
+    // M8b: early redirect presented combinationally in the resolve cycle (the
+    // registered flush_r above broadcasts the kill one cycle later).
+    assign redir_valid = b_i && b_mispred;
+    assign redir_pc    = b_taken ? b_tgt : (b_insn.pc + 32'd4);
+    assign redir_bsf   = b_bsf;
+
     // ================= MUL =================
     wire m_i0 = iss_valid[0] && (port0 == cpu_pkg::IUP_MUL);
     wire m_i1 = iss_valid[1] && (port1 == cpu_pkg::IUP_MUL);
@@ -408,7 +426,8 @@ module core_ooo (
         .flush_dtail(rob_flush_dtail),
         .ld_valid, .ld_req, .ld_ready,
         .st_valid, .st_req, .st_ready,
-        .resp_valid, .resp, .resp_replay);
+        .resp_valid, .resp, .resp_replay,
+        .probe_addr(probe_addr), .probe_hit(probe_hit));
     assign lsu_free_ld = lsu_ld_ok;
     assign lsu_free_st = lsu_st_ok;
 
