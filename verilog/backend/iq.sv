@@ -11,7 +11,7 @@ module iq (
     input  wire [1:0]  disp_valid,
     input  cpu_pkg::renamed_t d0,
     input  cpu_pkg::renamed_t d1,
-    output wire [5:0]  space,
+    output wire [$clog2(cpu_pkg::IQ_DEPTH+1)-1:0] space,
 
     // wakeup (qualified writebacks)
     input  cpu_pkg::writeback_t wb_a,
@@ -61,7 +61,7 @@ module iq (
     logic [PB-1:0] pdst_q[0:D-1];
     logic [RB-1:0] rob_q [0:D-1];
     logic [5:0]   bsf_q [0:D-1];
-    logic [9:0]   bix_q [0:D-1];
+    logic [$clog2(cpu_pkg::BHT_ENTRIES)-1:0] bix_q [0:D-1];
     logic [2:0]   fu_q  [0:D-1];
     logic         pt_q  [0:D-1];
     logic [31:0]  ptg_q [0:D-1];

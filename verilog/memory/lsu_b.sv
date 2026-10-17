@@ -80,8 +80,10 @@ module lsu_b (
     output wire [31:0] probe_addr,
     input  wire        probe_hit,
 );
-    localparam int DQ = cpu_pkg::LDQ_DEPTH;   // 8
-    localparam int SQ = cpu_pkg::STQ_DEPTH;   // 8
+    localparam int DQ = cpu_pkg::LDQ_DEPTH;   // load queue depth
+    localparam int SQ = cpu_pkg::STQ_DEPTH;   // store queue depth
+    localparam int LB = (DQ > 1) ? $clog2(DQ) : 1;   // load slot index bits
+    localparam int SB = (SQ > 1) ? $clog2(SQ) : 1;   // store slot index bits
     localparam int RB = $clog2(cpu_pkg::ROB_DEPTH);   // rob index bits
     localparam int PB = $clog2(cpu_pkg::PRF_NUM);     // physical tag bits
 
@@ -113,14 +115,20 @@ module lsu_b (
                                 (d << {off, 3'b000});
     endfunction
 
-    function automatic logic [2:0] lowest(input logic [7:0] v);
-        lowest = 3'd0;
-        for (int i = 7; i >= 0; i = i - 1)
-            if (v[i]) lowest = i[2:0];
+    function automatic logic [LB-1:0] lowest_l(input logic [DQ-1:0] v);
+        lowest_l = '0;
+        for (int i = DQ-1; i >= 0; i = i - 1)
+            if (v[i]) lowest_l = i[LB-1:0];
+    endfunction
+
+    function automatic logic [SB-1:0] lowest_s(input logic [SQ-1:0] v);
+        lowest_s = '0;
+        for (int i = SQ-1; i >= 0; i = i - 1)
+            if (v[i]) lowest_s = i[SB-1:0];
     endfunction
 
     // ---------------- load queue ----------------
-    logic [7:0]  l_valid;
+    logic [DQ-1:0] l_valid;
     logic [1:0]  l_st [0:DQ-1];        // 0=WAIT 1=SENT 2=DONE
     logic [31:0] l_addr [0:DQ-1];
     logic [2:0]  l_f3   [0:DQ-1];
@@ -129,8 +137,8 @@ module lsu_b (
     logic [31:0] l_data [0:DQ-1];
 
     // ---------------- store queue ----------------
-    logic [7:0]  s_valid, s_ret, s_drd;
-    logic [7:0]  s_dvalid;                 // M8: store data value present
+    logic [SQ-1:0] s_valid, s_ret, s_drd;
+    logic [SQ-1:0] s_dvalid;                 // M8: store data value present
     logic [31:0] s_addr [0:SQ-1];
     logic [31:0] s_data [0:SQ-1];
     logic [3:0]  s_mask [0:SQ-1];
@@ -155,7 +163,7 @@ module lsu_b (
     logic [RB-1:0] early_rob;
     logic [31:0] early_data;
     logic        rsp_hit;
-    logic [2:0]  rsp_i;
+    logic [LB-1:0]  rsp_i;
     logic        fwd_early;
     logic        rsp_do_early;
 
@@ -170,8 +178,8 @@ module lsu_b (
     // ---------------- issue / allocation ----------------
     wire is_store = (in_op == cpu_pkg::OP_STORE);
     wire is_load  = (in_op == cpu_pkg::OP_LOAD);
-    wire lf = (l_valid != 8'hff);
-    wire sf = (s_valid != 8'hff);
+    wire lf = (l_valid != {DQ{1'b1}});
+    wire sf = (s_valid != {SQ{1'b1}});
     // Readiness is split per op kind (loads need LDQ room, stores need STQ
     // room). The IQ selects using the candidate entry's registered op, so this
     // stays independent of the presented op and cannot form a comb loop.
@@ -183,13 +191,13 @@ module lsu_b (
     // alias a reused rob number).
     wire in_kill = flush_valid && cpu_pkg::flush_younger(in_rob, flush_rob, flush_dtail);
     wire in_fire = in_valid && !in_kill && (is_store ? st_alloc_ok : ld_alloc_ok);
-    wire rd0 = is_load && (in_pdst == 6'd0);
+    wire rd0 = is_load && (in_pdst == '0);
 
     assign ndone_valid = in_fire && (is_store || rd0);
     assign ndone_rob   = in_rob;
 
-    wire [2:0] lpos = lowest(~l_valid);
-    wire [2:0] spos = lowest(~s_valid);
+    wire [LB-1:0] lpos = lowest_l(~l_valid);
+    wire [SB-1:0] spos = lowest_s(~s_valid);
 
     wire [31:0] in_vaddr = in_base + in_imm;
     wire [1:0]  in_off   = in_vaddr[1:0];
@@ -198,7 +206,8 @@ module lsu_b (
     // The latched candidates below are chosen combinationally; a flush in the
     // same cycle would kill the picked entry after the latch decision, leaving
     // a stale selector. Filter the latch predicates with these masks.
-    logic [7:0] ld_kill_mask, st_kill_mask;
+    logic [DQ-1:0] ld_kill_mask;
+    logic [SQ-1:0] st_kill_mask;
     always_comb begin
         for (int i = 0; i < DQ; i = i + 1)
             ld_kill_mask[i] = flush_valid && l_valid[i] &&
@@ -253,7 +262,7 @@ module lsu_b (
     endfunction
 
     // ---------------- STQ drain: oldest retired, not yet drained ------------
-    logic [7:0] drain_mask;
+    logic [SQ-1:0] drain_mask;
     always_comb begin
         logic [11:0] best_seq;
         logic found;
@@ -289,9 +298,9 @@ module lsu_b (
 
     // latched drain candidate (payload must be stable until accepted)
     logic        st_v;
-    logic [2:0]  st_i;
-    wire [7:0]  drain_ok = drain_mask & ~st_kill_mask;
-    wire [7:0]  st_cand = st_v ? (8'd1 << st_i) : drain_ok;
+    logic [SB-1:0] st_i;
+    wire [SQ-1:0]  drain_ok = drain_mask & ~st_kill_mask;
+    wire [SQ-1:0]  st_cand = st_v ? ({{(SQ-1){1'b0}}, 1'b1} << st_i) : drain_ok;
 
     always_comb begin
         st_req = '0;
@@ -307,22 +316,19 @@ module lsu_b (
         // funct3 is not needed for stores downstream (mask/strb carry semantics)
         st_req.funct3 = 3'b000;
     end
-    assign st_valid = (st_cand != 8'd0);
+    assign st_valid = (st_cand != '0);
 
     // line mask derived from the single line-size knob (guard must follow it)
     wire [31:0] line_msk = ~(32'(cpu_pkg::LINE_BYTES) - 32'd1);
 
     // ---------------- load forwarding evaluation ----------------
-    logic [7:0]  f_go, f_fwd;
-    logic [7:0]  sl_any, blk_ov;   // per-load: older same-line store / overlap block
+    logic [DQ-1:0]  f_go, f_fwd;
+    logic [DQ-1:0]  sl_any, blk_ov;   // per-load: older same-line store / overlap block
     logic [31:0] f_data [0:DQ-1];
-    logic [2:0]  gs_i;             // oldest load blocked ONLY by the same-line guard
+    logic [LB-1:0] gs_i;             // oldest load blocked ONLY by the same-line guard
     logic        gs_v;
-    assign probe_addr = l_addr[gs_i];
     always_comb begin
         logic [3:0] lm;
-        logic gs_v_l;
-        logic [12:0] gs_key;
         lm = 4'b0;
         f_go = '0; f_fwd = '0; sl_any = '0; blk_ov = '0;
         for (int i = 0; i < DQ; i = i + 1) f_data[i] = 32'b0;
@@ -330,10 +336,10 @@ module lsu_b (
             if (l_valid[i] && (l_st[i] == 2'd0)) begin
                 logic [3:0] blk;
                 logic [12:0] best_key;
-                logic [2:0] best;
+                logic [SB-1:0] best;
                 logic found;
                 lm = lanes(l_f3[i], l_addr[i][1:0]);
-                blk = 1'b0; best_key = 13'd0; best = 3'd0; found = 1'b0;
+                blk = 1'b0; best_key = 13'd0; best = '0; found = 1'b0;
                 for (int s = 0; s < SQ; s = s + 1) begin
                     if (s_valid[s]) begin
                         logic ov, sl, older;
@@ -343,7 +349,7 @@ module lsu_b (
                         if (older && sl) sl_any[i] = 1'b1;    // same-line older store
                         if (older && ov && (!found || key_newer(s_key[s], best_key))) begin
                             best_key = s_key[s];
-                            best = s[2:0];
+                            best = s[SB-1:0];
                             found = 1'b1;
                         end
                     end
@@ -364,19 +370,35 @@ module lsu_b (
                 if (!f_fwd[i] && !blk && !sl_any[i]) f_go[i] = 1'b1;
             end
         end
-        // M9c: relax the same-line guard for the oldest load blocked ONLY by it
-        // when the D$ probe says its line currently hits (a hit never allocates,
-        // so the stale-fill race cannot occur).
-        gs_v_l = 1'b0; gs_i = 3'd0; gs_key = 13'h1fff;
+        // M9c: relax the same-line guard (see the separate block below).
+    end
+
+    // M9c guard relaxation index: the oldest load blocked ONLY by the same-line
+    // guard. Computed in its own block that does NOT read probe_hit, so gs_i
+    // cannot feed back through probe_addr -> probe_hit. That feedback was a
+    // circular-combinational path (signal gs_i) that made ABC synthesis
+    // explode from minutes to >20 min.
+    always_comb begin
+        logic gs_v_l;
+        logic [12:0] gs_key;
+        gs_v_l = 1'b0; gs_i = '0; gs_key = 13'h1fff;
         for (int i = 0; i < DQ; i = i + 1) begin
             if (l_valid[i] && (l_st[i] == 2'd0) && sl_any[i] && !blk_ov[i] &&
                 !f_fwd[i] && !ld_kill_mask[i] &&
                 (!gs_v_l || (l_key[i] < gs_key))) begin
-                gs_v_l = 1'b1; gs_i = i[2:0]; gs_key = l_key[i];
+                gs_v_l = 1'b1; gs_i = i[LB-1:0]; gs_key = l_key[i];
             end
         end
         gs_v = gs_v_l;
-        if (gs_v_l && probe_hit) f_go[gs_i] = 1'b1;
+    end
+    assign probe_addr = l_addr[gs_i];
+
+    // relaxed GO: waive the same-line guard when the D$ probe says the line hits
+    // (a hit never allocates, so the stale-fill race cannot occur).
+    logic [DQ-1:0] f_go_r;
+    always_comb begin
+        f_go_r = f_go;
+        if (gs_v && probe_hit) f_go_r[gs_i] = 1'b1;
     end
 
     // ---------------- load scheduler ----------------
@@ -387,25 +409,25 @@ module lsu_b (
     // then stays stable until accepted. Store-forward completions do not use the
     // memory port, so they also finish in the pick cycle.
     logic       sc_v;
-    logic [2:0] sc_i;
+    logic [LB-1:0] sc_i;
     logic       nsel_v;
-    logic [2:0] nsel_i;
-    wire [2:0]  cur_i   = sc_v ? sc_i : nsel_i;
+    logic [LB-1:0] nsel_i;
+    wire [LB-1:0]  cur_i   = sc_v ? sc_i : nsel_i;
     wire        cur_v   = sc_v || nsel_v;
-    wire        cur_go  = cur_v && f_go[cur_i];
+    wire        cur_go  = cur_v && f_go_r[cur_i];
     wire        cur_fwd = cur_v && f_fwd[cur_i];
     wire        cur_fwd_ok = cur_fwd && !ld_kill_mask[cur_i];
 
     always_comb begin
         logic best_found;
         logic [12:0] best_age;
-        logic [2:0] best;
-        best_age = 13'd8191; best = 3'd0; best_found = 1'b0;
+        logic [LB-1:0] best;
+        best_age = 13'd8191; best = '0; best_found = 1'b0;
         for (int i = 0; i < DQ; i = i + 1) begin
-            if (l_valid[i] && (l_st[i] == 2'd0) && (f_go[i] || f_fwd[i]) &&
+            if (l_valid[i] && (l_st[i] == 2'd0) && (f_go_r[i] || f_fwd[i]) &&
                 !ld_kill_mask[i]) begin
                 if (!best_found || (l_key[i] < best_age)) begin
-                    best_age = l_key[i]; best = i[2:0]; best_found = 1'b1;
+                    best_age = l_key[i]; best = i[LB-1:0]; best_found = 1'b1;
                 end
             end
         end
@@ -424,8 +446,8 @@ module lsu_b (
     assign ld_valid = cur_go;
 
     // ---------------- writeback selection ----------------
-    logic [7:0] done_mask;
-    wire [2:0] dsel;
+    logic [DQ-1:0] done_mask;
+    wire [LB-1:0] dsel;
     logic [12:0] dbest;
     always_comb begin
         logic found;
@@ -446,8 +468,8 @@ module lsu_b (
                     done_mask[i] = 1'b1;
         end
     end
-    assign dsel = lowest(done_mask);
-    wire have_done = (done_mask != 8'd0);
+    assign dsel = lowest_l(done_mask);
+    wire have_done = (done_mask != '0);
     wire hold_take = have_done && (!wb_hv || wb_grant);
 
     // ---------------- M8a early writeback selection ----------------
@@ -458,12 +480,12 @@ module lsu_b (
     // reclaim); the entry itself is released the same cycle, exactly once.
     always_comb begin
         rsp_hit = 1'b0;
-        rsp_i   = 3'd0;
+        rsp_i   = '0;
         if (resp_valid && !resp.is_store && !resp_replay) begin
             for (int i = 0; i < DQ; i = i + 1)
                 if (l_valid[i] && (l_st[i] == 2'd1) && (l_rob[i] == resp.rob)) begin
                     rsp_hit = 1'b1;
-                    rsp_i   = i[2:0];
+                    rsp_i   = i[LB-1:0];
                 end
         end
     end
@@ -575,12 +597,12 @@ module lsu_b (
             // latch it until accepted. Recording only via the latched path
             // would let lsu_a accept the same store twice (double drain).
             if (!st_v) begin
-                if (drain_ok != 8'd0) begin
+                if (drain_ok != '0) begin
                     if (st_ready) begin
-                        s_drd[lowest(drain_ok)] <= 1'b1;
+                        s_drd[lowest_s(drain_ok)] <= 1'b1;
                     end else begin
                         st_v <= 1'b1;
-                        st_i <= lowest(drain_ok);
+                        st_i <= lowest_s(drain_ok);
                     end
                 end
             end else if (st_ready) begin
@@ -625,12 +647,12 @@ module lsu_b (
                     // (retired-only set: wrap-safe retire-stamp compare)
                     logic found_d;
                     logic [11:0] best_seq2;
-                    logic [2:0] best2;
-                    found_d = 1'b0; best_seq2 = 12'd0; best2 = 3'd0;
+                    logic [SB-1:0] best2;
+                    found_d = 1'b0; best_seq2 = 12'd0; best2 = '0;
                     for (int i = 0; i < SQ; i = i + 1) begin
                         if (s_valid[i] && s_drd[i]) begin
                             if (!found_d || seq_older(s_seq[i], best_seq2)) begin
-                                best_seq2 = s_seq[i]; best2 = i[2:0]; found_d = 1'b1;
+                                best_seq2 = s_seq[i]; best2 = i[SB-1:0]; found_d = 1'b1;
                             end
                         end
                     end

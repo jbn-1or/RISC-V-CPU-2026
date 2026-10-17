@@ -5,17 +5,17 @@ package cpu_pkg;
 
     // ---- 参数：报告要求的参数化集中放这里 ----
     parameter int ISSUE_WIDTH = 2;      // 发射宽度
-    parameter int ROB_DEPTH   = 32;     // ROB 深度（E2：64 可参数化，实测默认 32 更优）
-    parameter int PRF_NUM     = 64;     // 物理寄存器个数（E3：128 可参数化，实测默认 64 更优）
-    parameter int IQ_DEPTH    = 16;     // 发射队列深度
+    parameter int ROB_DEPTH   = 32;     // S3-4 实测：32→64 回退（qsort -12%）；保持 32
+    parameter int PRF_NUM     = 64;     // S3-4 实测：64→128 回退；保持 64
+    parameter int IQ_DEPTH    = 16;     // S3-4 实测：16→32 回退；保持 16
     // M4: 写回同拍唤醒/操作数旁路（WB->IQ 同拍 CAM 命中即选中，操作数从
     // 写回总线直取）——省掉依赖链的 1 拍唤醒延迟；0 = 关闭（回归基线对照）。
     parameter int WB_BYPASS   = 1;
 
     // ---- 增补参数（references/docs/design.md §3.4）----
     parameter int DECODE_WIDTH = 2;     // 译码/重命名/提交宽度
-    parameter int LDQ_DEPTH    = 8;     // 在飞 load 上限
-    parameter int STQ_DEPTH    = 8;     // store 缓冲深度
+    parameter int LDQ_DEPTH    = 8;    // S3-5: 深度 8 足够（16 同 IPC，减半转发 CAM）
+    parameter int STQ_DEPTH    = 16;    // S3-5: 8->16（捕获主要收益 +2.6%；32/64 收益递减但使综合过慢）
     parameter int MUL_LAT      = 4;     // 乘法流水级数
     parameter int DIV_LAT_MAX  = 32;    // 除法迭代上限（radix-2，运行期提前退出）
     parameter int LINE_BYTES   = 32;    // 行大小（16 或 32 B：4/8 × AXI 字）
@@ -25,6 +25,7 @@ package cpu_pkg;
     parameter int MSHR_N       = 2;     // D$ 未命中合并项
     parameter int AXI_MAX_RD   = 8;     // 在飞 AXI 读上限（≤ 从机队列 16 − 裕量）
     parameter int AXI_MAX_WR   = 8;     // 在飞 AXI 写上限
+    // S3-1 实测中性（256→1024 仅 +0.1%），且大表使 ABC 综合显著变慢 → 回退小表以保可迭代。
     parameter int BHT_ENTRIES  = 256;
     parameter int BTB_ENTRIES  = 128;
     parameter int RAS_DEPTH    = 16;

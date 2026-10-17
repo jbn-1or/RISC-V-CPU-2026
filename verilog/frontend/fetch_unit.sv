@@ -67,10 +67,12 @@ module fetch_unit (
 
     wire [31:0] pc_q = pc_r;
     wire        issue_ok;
+    wire [31:0] req_pc;   // S3-2: request address (redirect target in a redirect cycle)
+    wire        req_half; // S3-3: half bit of req_pc
 
     icache u_ic (
         .clock, .reset,
-        .req_valid(issue_ok), .req_addr(pc_q),
+        .req_valid(issue_ok), .req_addr(req_pc),
         .busy(ic_busy), .rsp_valid(ic_rsp_valid),
         .rsp_word0(ic_w0), .rsp_word1(ic_w1),
         .rd_push_valid, .rd_push_addr, .rd_push_idx, .rd_push_ready,
@@ -163,6 +165,17 @@ module fetch_unit (
     wire s_pred_taken  = second_pred_taken;
     wire [31:0] s_pred_target = second_pred_taken ? second_pred_target : 32'b0;
 
+    // S3-2: fetch the redirect target in the same cycle it is detected instead
+    // of suppressing the request for one cycle. `redirect` implies `resp_ok`
+    // (hence !flush.valid && !miss_det), so it is mutually exclusive with the
+    // flush and miss paths. This removes the per-taken-branch request bubble.
+    // S3-3: likewise fetch the flush target (M8b early fe_flush) in its own
+    // cycle, removing the per-misprediction request bubble.
+    assign req_pc   = flush.valid ? (flush.pc    & 32'hfffffff8) :
+                      redirect    ? (red_target  & 32'hfffffff8) : pc_q;
+    assign req_half = flush.valid ? flush.pc[2] :
+                      redirect    ? red_target[2] : half_r;
+
     wire [$clog2(cpu_pkg::BHT_ENTRIES)-1:0] bp_lk0_ix, bp_lk1_ix;
     bp u_bp (
         .clock, .reset,
@@ -198,7 +211,17 @@ module fetch_unit (
     assign fe1 = ifb_mem[ifb_head + 3'd1];
 
     wire ifb_ok = (ifb_cnt + {2'b0, n_push}) <= 4'd6;
-    assign issue_ok = !ic_busy && !flush.valid && !redirect && !miss_det && ifb_ok;
+    // S3-2/S3-3: neither `redirect` nor `flush` suppresses the request; their
+    // targets are requested in the same cycle via req_pc. A miss still stalls
+    // (its block is re-requested after the refill), and a busy port or a full
+    // IFB still suppresses.
+    // On a flush cycle the pre-flush (wrong-path) request may be taking the I$
+    // miss path: the icache would start its refill and drop the newly issued
+    // target request, so the target block would be skipped. Suppress the
+    // same-cycle flush request in that case (the fallback re-requests flush.pc
+    // after the refill). `redirect` always implies a hit, so it is unaffected.
+    wire pend_miss = r_pend_q && !ic_rsp_valid;
+    assign issue_ok = !ic_busy && !miss_det && ifb_ok && !(flush.valid && pend_miss);
 
     wire cpu_pkg::decoded_t A_insn = push0 ? dec_d0 : dec_d1;
     // IFB entries (field-wise, Yosys has no '{} assignment pattern support)
@@ -242,22 +265,37 @@ module fetch_unit (
         end else begin
             r_pend_q <= issue_ok;
             if (issue_ok) begin
-                r_pc_q   <= pc_r;
-                r_half_q <= half_r;
+                r_pc_q   <= req_pc;
+                r_half_q <= req_half;
             end
 
             // ---- PC / bsf update (pipelined: one request per cycle) ----
             if (flush.valid) begin
-                pc_r   <= flush.pc & 32'hfffffff8;
-                half_r <= flush.pc[2];
+                // S3-3: if the flush-target request was issued this cycle,
+                // advance past it; otherwise restart at the target next cycle.
+                if (issue_ok) begin
+                    pc_r   <= (flush.pc & 32'hfffffff8) + 32'd8;
+                    half_r <= 1'b0;
+                end else begin
+                    pc_r   <= flush.pc & 32'hfffffff8;
+                    half_r <= flush.pc[2];
+                end
                 bsf_r  <= flush.bsf + 6'd1;
             end else if (miss_det) begin
                 pc_r   <= r_pc_q;      // re-request the missed block after refill
                 half_r <= r_half_q;
                 // bsf_r held: the same block is re-fetched
             end else if (redirect) begin
-                pc_r   <= red_target & 32'hfffffff8;
-                half_r <= red_target[2];
+                // S3-2: the target request was issued this cycle (req_pc), so
+                // advance past it; if the port was busy / IFB full, restart at
+                // the target next cycle instead.
+                if (issue_ok) begin
+                    pc_r   <= (red_target & 32'hfffffff8) + 32'd8;
+                    half_r <= 1'b0;
+                end else begin
+                    pc_r   <= red_target & 32'hfffffff8;
+                    half_r <= red_target[2];
+                end
                 bsf_r  <= first_bsf + {5'b0, first_insn.is_branch} +
                           (has_second ? {5'b0, dec_d1.is_branch} : 6'd0);
             end else begin

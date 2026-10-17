@@ -19,7 +19,7 @@ module rename (
 
     // ---- structural limits ----
     input  wire [$clog2(cpu_pkg::ROB_DEPTH):0] rob_space,
-    input  wire [5:0]  iq_space,
+    input  wire [$clog2(cpu_pkg::IQ_DEPTH+1)-1:0] iq_space,
     input  wire [$clog2(cpu_pkg::ROB_DEPTH)-1:0] rob_alloc_ptr,
 
     // ---- rel_msk / recovery inputs ----
@@ -97,10 +97,10 @@ module rename (
     always_comb need_all = {{PB{1'b0}}, need0} + {{PB{1'b0}}, need1};
 
     wire take0 = !flush_valid && in_valid[0] &&
-                 (rob_space >= 6'd1) && (iq_space != 6'd0) &&
-                 (need0 ? (free_cnt != 7'd0) : 1'b1);
+                 (rob_space >= 'd1) && (iq_space != '0) &&
+                 (need0 ? (free_cnt != '0) : 1'b1);
     wire take1 = take0 && in_valid[1] &&
-                 (rob_space >= 6'd2) && (iq_space >= 6'd2) &&
+                 (rob_space >= 'd2) && (iq_space >= 'd2) &&
                  (need_all <= free_cnt) &&
                  (!need1 || (fe1 != '0));
 

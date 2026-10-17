@@ -116,9 +116,9 @@ module rob (
         wb_b_ok    = wb_b;
         wb_b_ok.valid = wb_b.valid && b_ok;
     end
-    assign rec_a_valid = wb_a.valid && !a_ok && (wb_a.prf_tag != 6'd0);
+    assign rec_a_valid = wb_a.valid && !a_ok && (wb_a.prf_tag != '0);
     assign rec_a_tag   = wb_a.prf_tag;
-    assign rec_b_valid = wb_b.valid && !b_ok && (wb_b.prf_tag != 6'd0);
+    assign rec_b_valid = wb_b.valid && !b_ok && (wb_b.prf_tag != '0);
     assign rec_b_tag   = wb_b.prf_tag;
 
     // ---------------- commit (in order, <=2/cycle) ----------------

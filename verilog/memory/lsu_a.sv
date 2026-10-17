@@ -83,33 +83,33 @@ module lsu_a (
 
     assign ld_ready = dc_lk_ready;
 
-    // ---------------- store drain FSM ----------------
-    localparam logic [1:0] S_IDLE = 2'd0, S_SU = 2'd1, S_PUSH = 2'd2;
-
-    logic [1:0]  st_state;
-    logic [31:0] cur_addr, cur_data;
-    logic [3:0]  cur_strb;
-    logic [RB-1:0] cur_rob;
+    // ---------------- store drain (S3-5: single-cycle) ----------------
+    // The D$ hit-update (su) and the AXI write push (wrQ) are independent
+    // resources, so one store completes per cycle when both accept. Locking the
+    // D$ update and the memory write to the same cycle (wr_push_valid gated by
+    // the su side) keeps them atomic. This replaces the old IDLE/SU/PUSH
+    // 3-cycle sequence that capped drain throughput at 1 store/3 cycles.
     logic [3:0]  seq_q;
     logic [RB-1:0] tagrob [0:15];
     logic [31:0] tagaddr [0:15];
     logic        tagmiss [0:15];
-    logic        cur_hit;
 
     wire cur_unc = cpu_pkg::is_uncached(st_req.addr);
-    assign st_ready = (st_state == S_IDLE);
+    wire su_acc  = dc_su_ready || cur_unc;
+    assign wr_push_valid = st_valid && su_acc;
+    wire drain_go = wr_push_valid && wr_push_ready;
+    assign st_ready = drain_go;
 
-    wire su_valid = (st_state == S_SU);
-    wire [31:0] su_addr  = cur_addr;
-    wire [31:0] su_data  = cur_data;
-    wire [3:0]  su_strb  = cur_strb;
+    wire su_valid = st_valid && !cur_unc;
+    wire [31:0] su_addr  = st_req.addr;
+    wire [31:0] su_data  = st_req.wdata;
+    wire [3:0]  su_strb  = st_req.wstrb;
 
-    assign wr_push_valid = (st_state == S_PUSH);
     // AXI writes must be word-aligned (the byte lanes travel in wstrb); the
     // raw byte address is kept for the D$ hit-update and tagaddr/invalidate.
-    assign wr_push_addr  = {cur_addr[31:2], 2'b00};
-    assign wr_push_data  = cur_data;
-    assign wr_push_strb  = cur_strb;
+    assign wr_push_addr  = {st_req.addr[31:2], 2'b00};
+    assign wr_push_data  = st_req.wdata;
+    assign wr_push_strb  = st_req.wstrb;
     assign wr_push_tag   = seq_q;
 
     // ---------------- response merge ----------------
@@ -148,7 +148,6 @@ module lsu_a (
     // ---------------- state ----------------
     always_ff @(posedge clock) begin
         if (reset) begin
-            st_state <= S_IDLE;
             seq_q <= 4'd0;
             sp_v <= 1'b0;
             sp_rob <= 5'd0;
@@ -162,28 +161,12 @@ module lsu_a (
                 sp_v <= 1'b0;
             end
 
-            case (st_state)
-                S_IDLE: if (st_valid && st_ready) begin
-                    cur_addr <= st_req.addr;
-                    cur_data <= st_req.wdata;
-                    cur_strb <= st_req.wstrb;
-                    cur_rob  <= st_req.rob;
-                    cur_hit  <= 1'b0;
-                    st_state <= cur_unc ? S_PUSH : S_SU;
-                end
-                S_SU: if (dc_su_ready) begin
-                    cur_hit  <= dc_su_hit;
-                    st_state <= S_PUSH;
-                end
-                S_PUSH: if (wr_push_ready) begin
-                    tagrob[seq_q]  <= cur_rob;
-                    tagaddr[seq_q] <= cur_addr;
-                    tagmiss[seq_q] <= !cur_hit;
-                    seq_q <= seq_q + 4'd1;
-                    st_state <= S_IDLE;
-                end
-                default: st_state <= S_IDLE;
-            endcase
+            if (drain_go) begin
+                tagrob[seq_q]  <= st_req.rob;
+                tagaddr[seq_q] <= st_req.addr;
+                tagmiss[seq_q] <= cur_unc ? 1'b1 : !dc_su_hit;
+                seq_q <= seq_q + 4'd1;
+            end
         end
     end
 endmodule

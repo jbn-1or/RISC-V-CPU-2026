@@ -96,7 +96,7 @@ module core_ooo (
     assign btb_upd_pc     = b_insn.pc;
     assign btb_upd_target = b_tgt;
 
-    wire [5:0]  iq_space;
+    wire [$clog2(cpu_pkg::IQ_DEPTH+1)-1:0] iq_space;
     wire [1:0]  iss_valid;
     cpu_pkg::issue_t iss0, iss1;
     cpu_pkg::iup_e   port0, port1;
@@ -115,7 +115,8 @@ module core_ooo (
         .wb_clr_mask(wb_clr_mask), .reclaim_mask(reclaim_mask),
         .cmt_free_mask(cmt_free_mask),
         .flush_free_mask(flush_free_mask), .flush_pend_mask(flush_pend_mask),
-        .flush_valid(rob_flush_valid), .restore_valid(restore_valid),
+        .flush_valid(rob_flush_valid),
+        .restore_valid(restore_valid),
         .restore_pdst(restore_pdst),
         .rob_valid(rob_valid), .rob_rd0(rob_rd0), .rob_rd1(rob_rd1),
         .rob_pdst0(rob_pdst0), .rob_pdst1(rob_pdst1),
@@ -184,8 +185,8 @@ module core_ooo (
     // so a same-cycle PRF read would return the stale value). ps==0 (x0 / no
     // operand) is never bypassed — PRF[0] is the constant 0.
     wire        byp_en   = (cpu_pkg::WB_BYPASS != 0);
-    wire        ba_byp_v = byp_en && ba_ok.valid && (ba_ok.prf_tag != 6'd0);
-    wire        bb_byp_v = byp_en && bb_ok.valid && (bb_ok.prf_tag != 6'd0);
+    wire        ba_byp_v = byp_en && ba_ok.valid && (ba_ok.prf_tag != '0);
+    wire        bb_byp_v = byp_en && bb_ok.valid && (bb_ok.prf_tag != '0);
     wire [31:0] opa0 = (ba_byp_v && (iss0.ps1 == ba_ok.prf_tag)) ? ba_ok.result :
                        (bb_byp_v && (iss0.ps1 == bb_ok.prf_tag)) ? bb_ok.result : prf_r0;
     wire [31:0] opb0 = iss0.insn.uses_imm ? iss0.insn.imm :
@@ -223,7 +224,7 @@ module core_ooo (
             else a0_hv <= 1'b0;
         end else if (a0_go) begin
             a0_h <= {1'b1, a0_pdst, a0_rob, a0_res}; a0_hv <= 1'b1;
-        end else if (rob_flush_valid && a0_hv && (a0_h.prf_tag == 6'd0) &&
+        end else if (rob_flush_valid && a0_hv && (a0_h.prf_tag == '0) &&
                      cpu_pkg::flush_younger(a0_h.rob, rob_flush_rob, rob_flush_dtail)) a0_hv <= 1'b0;
     end
 
@@ -253,7 +254,7 @@ module core_ooo (
             else a1_hv <= 1'b0;
         end else if (a1_go) begin
             a1_h <= {1'b1, a1_pdst, a1_rob, a1_res}; a1_hv <= 1'b1;
-        end else if (rob_flush_valid && a1_hv && (a1_h.prf_tag == 6'd0) &&
+        end else if (rob_flush_valid && a1_hv && (a1_h.prf_tag == '0) &&
                      cpu_pkg::flush_younger(a1_h.rob, rob_flush_rob, rob_flush_dtail)) a1_hv <= 1'b0;
     end
 
@@ -289,7 +290,7 @@ module core_ooo (
             else b_hv <= 1'b0;
         end else if (b_go) begin
             b_h <= {1'b1, b_pdst, b_rob, b_link}; b_hv <= 1'b1;
-        end else if (rob_flush_valid && b_hv && (b_h.prf_tag == 6'd0) &&
+        end else if (rob_flush_valid && b_hv && (b_h.prf_tag == '0) &&
                      cpu_pkg::flush_younger(b_h.rob, rob_flush_rob, rob_flush_dtail)) b_hv <= 1'b0;
     end
 
@@ -372,7 +373,7 @@ module core_ooo (
         // wiring `is_fuse` through rename/IQ is deferred (single-beat path used).
         .req_f3a(d_insn.funct3), .req_f3b(3'b0), .req_fused(1'b0),
         .req_tag_a(d_pdst), .req_rob_a(d_rob),
-        .req_tag_b(6'b0), .req_rob_b(5'b0),
+        .req_tag_b('0), .req_rob_b('0),
         .req_ready(div_req_ready),
         .wb_valid(div_wb_valid), .wb_tag(div_wb_tag), .wb_rob(div_wb_rob),
         .wb_data(div_wb_data));
