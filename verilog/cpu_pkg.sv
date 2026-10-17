@@ -12,7 +12,7 @@ package cpu_pkg;
     // 写回总线直取）——省掉依赖链的 1 拍唤醒延迟；0 = 关闭（回归基线对照）。
     parameter int WB_BYPASS   = 1;
 
-    // ---- 增补参数（docs/design.md §3.4）----
+    // ---- 增补参数（references/docs/design.md §3.4）----
     parameter int DECODE_WIDTH = 2;     // 译码/重命名/提交宽度
     parameter int LDQ_DEPTH    = 8;     // 在飞 load 上限
     parameter int STQ_DEPTH    = 8;     // store 缓冲深度
@@ -117,7 +117,7 @@ package cpu_pkg;
         logic [31:0] rdata;                  // load 数据（store 响应时忽略）
     } mem_resp_t;
 
-    // ==== M2 增补（docs/design.md §4.2/§5.1/§6；纯新增，不动既有字段）====
+    // ==== M2 增补（references/docs/design.md §4.2/§5.1/§6；纯新增，不动既有字段）====
 
     // FE→rename 2 路流元素（= IFB 表项内容，design §5.1）
     typedef struct packed {
