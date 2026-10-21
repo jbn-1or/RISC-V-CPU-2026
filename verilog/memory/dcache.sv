@@ -84,10 +84,16 @@ module dcache (
     localparam int NW   = cpu_pkg::LINE_BYTES / 4;      // words per line 4/8
     localparam int WB   = $clog2(NW);                   // word index bits 2/3
     localparam int TAGB = 32 - SETB - OFFB;             // 20/19
+    // Cached lines always have addr[31:28] == 0 (is_uncached() is exactly
+    // addr[31:28] != 0), so the top four tag bits are constant zero for every
+    // valid tag entry. Store/compare only the low CTAGB bits.
+    localparam int CTAGB = TAGB - 4;                    // 16/15
     localparam int PWB  = $clog2(NW + 1);               // push-counter bits 3/4
     localparam int MN   = cpu_pkg::MSHR_N;
     localparam int RB   = $clog2(cpu_pkg::ROB_DEPTH);
-    localparam int FD   = 16;                           // response FIFO depth
+    localparam int FD   = 8;                            // response FIFO depth
+    localparam int FW   = $clog2(FD);                   // FIFO pointer bits
+    localparam int FL   = $clog2(FD + 1);               // FIFO level bits
     localparam logic [1:0] MN_LAST = (MN == 4) ? 2'd3 : (MN == 2) ? 2'd1 : 2'd0;
     localparam logic [PWB-1:0] CAP_ONE  = 1;
     localparam logic [PWB-1:0] CAP_FULL = NW[PWB-1:0];
@@ -106,19 +112,32 @@ module dcache (
 
     // ---------------- tag / valid arrays ----------------
     logic [cpu_pkg::DC_LINES-1:0] v_q;
-    logic [TAGB-1:0] tag_q [0:cpu_pkg::DC_LINES-1];
+    logic [CTAGB-1:0] tag_q [0:cpu_pkg::DC_LINES-1];
 
-    // M9c: combinationally probe whether probe_addr currently hits.
-    assign probe_hit = v_q[probe_addr[SETB+OFFB-1:OFFB]] &&
-                       (tag_q[probe_addr[SETB+OFFB-1:OFFB]] == probe_addr[31:SETB+OFFB]);
+    // M9c: combinationally probe whether probe_addr currently hits. The
+    // valid-only form is a safe superset (a false positive just sends the load
+    // into a miss/replay), and removes the wide tag mux and tag compare from
+    // the same-cycle lsu_b guard path.
+    assign probe_hit = !cpu_pkg::is_uncached(probe_addr) &&
+                       v_q[probe_addr[SETB+OFFB-1:OFFB]];
 
     // ---------------- lookup pipeline (1-cycle SRAM read) ----------------
+    // The tag half of the lookup is read in the op-register cycle and parked
+    // in the same flop stage as the SRAM data output, so the 1024:1 tag mux is
+    // not in the pend-evaluation cycle. The valid bit stays a live read
+    // (v_q one-bit mux) so a same-cycle invalidate/alloc clear still wins.
+    logic [CTAGB-1:0] tag_a_q;
+    logic            valid_a_q;
+    logic [CTAGB-1:0] tag_b_q;
     logic            pend_q;
     logic [RB-1:0]   pend_tok_q;
-    logic [TAGB-1:0] pend_tag_q;
+    logic [CTAGB-1:0] pend_tag_q;
     logic [SETB-1:0] pend_set_q;
     logic [2:0]      pend_word_q;
     logic            pend_unc_q;
+    // flush seen while the lookup sat in the op register (the eval cycle only
+    // sees a same-cycle flush)
+    logic            pend_kill_q;
 
     // ---------------- MSHR (MSHR_N entries) ----------------
     logic            m_valid  [0:MN-1];
@@ -136,52 +155,64 @@ module dcache (
     logic [NW-1:0]   m_wv     [0:MN-1];
     logic [RB-1:0]   m_wt     [0:MN-1][0:NW-1];
     logic [NW-1:0]   m_wkill  [0:MN-1];
+    // Trigger response already enqueued. A killed MSHR whose trigger never
+    // fired still owns one reservation; a killed MSHR whose trigger did fire
+    // does not (the event is already in the FIFO).
+    logic            m_trig_done [0:MN-1];
 
-    // Committed MSHR events (events that will definitely be enqueued later):
-    // each live MSHR has one trigger waiter and each occupied word slot one
-    // parked waiter. Conservative for a trigger that already fired (it stays
-    // counted until its slot frees), which only tightens the gate below.
-    logic [5:0] wcnt;
-    always_comb begin
-        wcnt = 6'd0;
-        for (int s = 0; s < MN; s = s + 1) begin
-            if (m_valid[s] && !m_killed[s]) wcnt = wcnt + 6'd1;
-            for (int w = 0; w < NW; w = w + 1)
-                if (m_wv[s][w] && !m_wkill[s][w]) wcnt = wcnt + 6'd1;
-        end
-    end
+    // ---------------- response-space credit counter ----------------
+    // occ_q counts every response that is either already in the FIFO or
+    // reserved for an in-flight operation (op/pend lookup, MSHR trigger,
+    // parked word waiter). Admission is then a 4-bit compare instead of an
+    // 18-input popcount plus a 7-bit adder plus a compare, which is the
+    // dominant flop-to-flop path in this design. Events move a reservation
+    // into the FIFO and therefore do not change occ_q; only a dequeue or a
+    // killed reservation that can never produce an event releases a slot.
+    logic [FL-1:0] occ_q;
 
     // ---------------- response FIFO (FD deep, up to 3 enqueues/cycle) ------
     logic [RB-1:0] f_tok [0:FD-1];
     logic [31:0] f_dat [0:FD-1];
     logic        f_rep [0:FD-1];
-    logic [3:0]  f_head, f_tail;
-    logic [4:0]  f_lvl;
-    assign rsp_valid  = (f_lvl != 5'd0);
+    logic [FW-1:0] f_head, f_tail;
+    logic [FL-1:0] f_lvl;
+    assign rsp_valid  = (f_lvl != '0);
     assign rsp_token  = f_tok[f_head];
     assign rsp_data   = f_dat[f_head];
     assign rsp_replay = f_rep[f_head];
-    wire   rsp_deq    = (f_lvl != 5'd0) && rsp_ready;
+    wire   rsp_deq    = (f_lvl != '0) && rsp_ready;
+
+    // ---------------- shared SRAM input op register ----------------
+    // Exactly one cache operation (refill write, load lookup, or store
+    // hit-update) is captured per cycle. The banks are driven from these flops
+    // instead of the lookup/tag cone, so the SRAM address/control pins see a
+    // flop-to-pin path. A read's bank data is valid one cycle after the bank
+    // samples the captured op, and pend_* is loaded in that same cycle.
+    logic            op_valid_q;
+    logic            op_read_q;
+    logic            op_refill_q;
+    logic            op_write_q;
+    logic [1:0]      op_slot_q;
+    logic [2:0]      op_word_q;
+    logic [SETB-1:0] op_set_q;
+    logic [TAGB-1:0] op_tag_q;
+    logic [RB-1:0]   op_tok_q;
+    logic [31:0]     op_wdata_q;
+    logic [3:0]      op_wmask_q;
 
     // ---------------- port owner arbitration ----------------
     wire [1:0]  rslot = rd_rsp_idx[4:3];
     wire [2:0]  rword = rd_rsp_idx[2:0];
-    wire [WB-1:0] rwidx = rword[WB-1:0];
     wire        wref  = rd_rsp_valid && (rslot <= MN_LAST) && m_valid[rslot];  // valid refill write
     // A request killed by the flush must not enter the miss path at all: its
-    // latched lookup would allocate an MSHR one cycle later, when flush_valid
-    // has already dropped (pend_kill below would miss it) and its stale
-    // completion could later alias a reused rob number.
+    // latched lookup would allocate an MSHR two cycles later, when flush_valid
+    // has already dropped (the op-stage and pend kills below would miss it) and
+    // its stale completion could later alias a reused rob number.
     wire lk_kill = flush_valid && cpu_pkg::flush_younger(lk_token, flush_rob, flush_dtail);
-    // FIFO admission: the accepted lookup will commit one more event (next
-    // cycle, at the latest). Invariant (induction over the pend stage): every
-    // accepted lookup either emits its event one cycle later or joins wcnt, and
-    // every wcnt event fires without adding to it, so
-    //   f_lvl + wcnt + pend_q <= FD   is preserved across cycles;
-    // reserving one more entry for the new lookup keeps the FIFO from ever
-    // needing more than FD slots.
-    wire [6:0] fifo_used = {2'b0, f_lvl} + {1'b0, wcnt} + {6'b0, pend_q} + 7'd1;
-    wire lk_acc = !wref && !lk_kill && lk_valid && (fifo_used <= 7'(FD));
+    // FIFO admission: occ_q already reserves a slot for every accepted lookup
+    // (op register + pend stage), every live MSHR trigger and every parked
+    // word waiter, so the decision is only "is one slot free?".
+    wire lk_acc = !wref && !lk_kill && lk_valid && (occ_q < FL'(FD));
     wire su_acc = !wref && !lk_acc && su_valid;
     assign lk_ready = lk_acc;
     assign su_ready = su_acc;
@@ -206,33 +237,53 @@ module dcache (
     assign rd_push_idx   = {push_slot, push_word};    // {slot[1:0], word[2:0]}
 
     // ---------------- SRAM bank controls (one bank per line word) ----------
-    wire [2:0]  acc_word = lk_acc ? lk_addr[OFFB-1:2] : su_acc ? su_addr[OFFB-1:2] : rword;
+    // B stage: the op register drives the banks. A refill write completing its
+    // line at this clock edge is visible to a store hit-update accepted in the
+    // same cycle; that store's own bank write happens one cycle later (after
+    // the fill), so it lands on top of the freshly filled line.
+    wire        b_refill      = op_valid_q && op_refill_q;
+    wire [1:0]  b_slot        = op_slot_q;
+    wire [WB-1:0] b_widx      = op_word_q[WB-1:0];
+    wire        b_refill_wr   = b_refill && m_valid[b_slot] && !m_bypass[b_slot];
+    wire [NW-1:0] b_dne       = m_done[b_slot] | (ONE_HOT << b_widx);
+    wire        b_refill_last = b_refill_wr && (b_dne == ALL_DONE);
+
+    wire b_store_wr = op_valid_q && op_write_q && !op_refill_q;
+    wire b_wr_hit = b_store_wr && valid_a_q &&
+                    (tag_a_q == op_tag_q[CTAGB-1:0]);
+    assign su_hit = b_wr_hit;
+
+    // A stage: select the single operation for this cycle and capture it.
+    wire [2:0]      acc_word = lk_acc ? lk_addr[OFFB-1:2] :
+                               su_acc ? su_addr[OFFB-1:2] : rword;
     wire [SETB-1:0] acc_set = lk_acc ? lk_addr[SETB+OFFB-1:OFFB] :
                               su_acc ? su_addr[SETB+OFFB-1:OFFB] : m_set[rslot];
-    wire        acc_we   = su_acc || (wref && !m_bypass[rslot]);
-    wire [31:0] acc_wdata = su_acc ? su_data : rd_rsp_data;
-    wire [3:0]  acc_wmask = su_acc ? su_strb : 4'hf;
+    wire            a_set_fill = b_refill_last && (m_set[b_slot] == acc_set);
+    wire [31:0]     acc_wdata = su_acc ? su_data : rd_rsp_data;
+    wire [3:0]      acc_wmask = su_acc ? su_strb : 4'hf;
+    wire            a_op_valid    = lk_acc || wref || su_acc;
+    wire            op_read_sel   = lk_acc;
+    wire            op_refill_sel = wref;
+    wire            op_write_sel  = su_acc || (wref && !m_bypass[rslot]);
 
-    // store update only writes on a hit
-    wire su_hit_c = v_q[su_addr[SETB+OFFB-1:OFFB]] &&
-                    (tag_q[su_addr[SETB+OFFB-1:OFFB]] == su_addr[31:SETB+OFFB]);
-    assign su_hit = su_hit_c;
-
-    // only the bank owning the accessed word is enabled
-    wire acc_en = lk_acc || (su_acc && su_hit_c) || (wref && !m_bypass[rslot]);
+    // B stage: decode the captured op into per-bank enables.
+    wire b_read  = op_valid_q && op_read_q;
+    wire b_write = op_valid_q && op_write_q;
+    wire b_en    = b_read || b_refill_wr || b_wr_hit;
+    wire b_we    = b_refill_wr || b_wr_hit;
     logic [NW-1:0] bank_en;
     always_comb begin
         bank_en = '0;
         for (int w = 0; w < NW; w = w + 1)
-            bank_en[w] = acc_en && (acc_word == w[2:0]);
+            bank_en[w] = b_en && (op_word_q[WB-1:0] == w[WB-1:0]);
     end
 
     wire [31:0] bank_rdata [0:NW-1];
     generate
         for (genvar g = 0; g < NW; g = g + 1) begin : g_dbank
             sram_fakeram #(.DEPTH(cpu_pkg::DC_LINES), .WIDTH(32), .WRITE_GRANULARITY(8)) u_bank (
-                .clk(clock), .en(bank_en[g]), .we(acc_we), .wmask(acc_wmask),
-                .addr(acc_set), .wdata(acc_wdata), .rdata(bank_rdata[g]));
+                .clk(clock), .en(bank_en[g]), .we(b_we), .wmask(op_wmask_q),
+                .addr(op_set_q), .wdata(op_wdata_q), .rdata(bank_rdata[g]));
         end
     endgenerate
 
@@ -244,7 +295,8 @@ module dcache (
     end
 
     // ---------------- lookup result ----------------
-    wire pend_hit  = pend_q && v_q[pend_set_q] && (tag_q[pend_set_q] == pend_tag_q);
+    wire pend_hit  = pend_q && !pend_unc_q && v_q[pend_set_q] &&
+                     (tag_b_q == pend_tag_q);
     // P0 partial (same-line merge) hit: the line is being filled by an MSHR and
     // this lookup's specific word has already been written back, so the bank data
     // is valid even though v_q is still cleared (cleared at MSHR alloc). Without
@@ -269,7 +321,8 @@ module dcache (
     // A request that is younger than the flush point must not allocate in the
     // same cycle the flush arrives (the kill scan below only sees already-set
     // m_valid), otherwise its stale completion could later alias a reused rob number.
-    wire pend_kill = flush_valid && cpu_pkg::flush_younger(pend_tok_q, flush_rob, flush_dtail);
+    wire pend_kill = pend_q && (pend_kill_q ||
+                     (flush_valid && cpu_pkg::flush_younger(pend_tok_q, flush_rob, flush_dtail)));
     logic [1:0] alloc_slot;
     logic       alloc_free;
     logic       set_busy;
@@ -305,43 +358,89 @@ module dcache (
     end
     wire [WB-1:0] pend_widx = pend_word_q[WB-1:0];
     wire mg_cand = pend_miss && !pend_unc && mg_en && !mg_done && !pend_kill;
-    // the word lands in this very cycle: answer now, a parked token would miss
-    // the arrival event (registration is visible one cycle later).
-    wire mg_now  = mg_cand && wref && (rslot == mg_slot) && (rwidx == pend_widx);
+    // the word is in the op register now and lands at this clock edge: answer
+    // with the captured refill data instead of the (stale) bank read.
+    wire mg_now  = mg_cand && b_refill_wr && (b_slot == mg_slot) && (b_widx == pend_widx);
     // park only when this word's single waiter slot is free
     wire mg_reg  = mg_cand && !mg_now && !m_wv[mg_slot][pend_widx];
 
     // keyword completion (trigger word arrived, waiter still alive)
-    wire kw_ev = wref && m_valid[rslot] && (rword == m_trig[rslot]) && !m_killed[rslot];
-    // parked waiter served at its word arrival (m_wv is cleared the same cycle)
-    wire park_ev = wref && m_valid[rslot] && m_wv[rslot][rwidx] && !m_wkill[rslot][rwidx];
+    wire kw_ev = b_refill && m_valid[b_slot] && (b_widx == m_trig[b_slot][WB-1:0]) &&
+                 !m_killed[b_slot];
+    // parked waiter served at its word arrival (m_wv is cleared at this edge)
+    wire park_ev = b_refill && m_valid[b_slot] && m_wv[b_slot][b_widx] &&
+                   !m_wkill[b_slot][b_widx];
+
+    // MSHR slot frees at this edge (bypass has a single word).
+    wire b_free = b_refill && m_valid[b_slot] &&
+                  (m_bypass[b_slot] || (b_dne == ALL_DONE));
+    // Reservations that can never produce a FIFO event are released here so a
+    // killed flush shadow cannot permanently consume the response space.
+    // A trigger whose event already fired (m_trig_done) is already in f_lvl.
+    wire rel_trig = b_free && m_killed[b_slot] && !m_trig_done[b_slot] && !kw_ev;
+    wire rel_park = b_refill && m_valid[b_slot] && !m_bypass[b_slot] &&
+                    m_wv[b_slot][b_widx] && m_wkill[b_slot][b_widx];
 
     // response FIFO events: E0 = trigger word, E1 = parked word waiter,
     // E2 = pending lookup (hit / partial hit / merged word data / replay).
     wire ev0 = kw_ev;
-    wire [RB-1:0] ev0_tok = m_token[rslot];
-    wire [31:0]   ev0_dat = rd_rsp_data;
+    wire [RB-1:0] ev0_tok = m_token[b_slot];
+    wire [31:0]   ev0_dat = op_wdata_q;
     wire ev1 = park_ev;
-    wire [RB-1:0] ev1_tok = m_wt[rslot][rwidx];
-    wire [31:0]   ev1_dat = rd_rsp_data;
+    wire [RB-1:0] ev1_tok = m_wt[b_slot][b_widx];
+    wire [31:0]   ev1_dat = op_wdata_q;
     wire ev2 = pend_pok || mg_now || (pend_miss && !alloc_en && !mg_reg && !mg_now);
     wire [RB-1:0] ev2_tok = pend_tok_q;
-    wire [31:0]   ev2_dat = pend_pok ? bank_data : (mg_now ? rd_rsp_data : 32'b0);
+    wire [31:0]   ev2_dat = pend_pok ? bank_data : (mg_now ? op_wdata_q : 32'b0);
     wire          ev2_rep = !(pend_pok || mg_now);
+
+    // Write positions wrap modulo FD (FD is a power of two).
+    wire [FW-1:0] f_pos0 = f_tail;
+    wire [FW-1:0] f_pos1 = f_tail + ev0;
+    wire [FW-1:0] f_pos2 = f_tail + ev0 + ev1;
 
     // ---------------- state ----------------
 `ifndef SYNTHESIS
-    // The fifo_used bound above is an invariant; catch any violation (a lost
-    // or duplicated event) at the cycle it happens instead of corrupting data.
+    // The FIFO bound is an invariant; catch any violation (a lost or
+    // duplicated event) at the cycle it happens instead of corrupting data.
     always_ff @(posedge clock)
         if (!reset && (({1'b0, f_lvl} + ev0 + ev1 + ev2) > 6'(FD)))
             $fatal(1, "dcache: response FIFO overflow");
+    // occ_q must always equal FIFO occupancy plus all outstanding
+    // reservations (op/pend lookups, live triggers, occupied park slots).
+    logic [FL:0] resid;
+    always_comb begin
+        resid = {1'b0, op_read_q} + {1'b0, pend_q};
+        for (int s = 0; s < MN; s = s + 1) begin
+            if (m_valid[s] && !m_trig_done[s]) resid = resid + 1'b1;
+            for (int w = 0; w < NW; w = w + 1)
+                if (m_wv[s][w]) resid = resid + 1'b1;
+        end
+    end
+    always_ff @(posedge clock)
+        if (!reset && ({1'b0, occ_q} != ({1'b0, f_lvl} + resid)))
+            $fatal(1, "dcache: response credit accounting mismatch");
 `endif
     always_ff @(posedge clock) begin
         if (reset) begin
             v_q <= '0;
+            tag_a_q <= '0;
+            valid_a_q <= 1'b0;
+            tag_b_q <= '0;
             pend_q <= 1'b0;
             pend_unc_q <= 1'b0;
+            pend_kill_q <= 1'b0;
+            op_valid_q <= 1'b0;
+            op_read_q  <= 1'b0;
+            op_refill_q <= 1'b0;
+            op_write_q <= 1'b0;
+            op_slot_q  <= 2'd0;
+            op_word_q  <= 3'd0;
+            op_set_q   <= '0;
+            op_tag_q   <= '0;
+            op_tok_q   <= '0;
+            op_wdata_q <= '0;
+            op_wmask_q <= '0;
             for (int s = 0; s < MN; s = s + 1) begin
                 m_valid[s]   <= 1'b0;
                 m_killed[s]  <= 1'b0;
@@ -349,17 +448,30 @@ module dcache (
                 m_done[s]    <= '0;
                 m_wv[s]      <= '0;
                 m_wkill[s]   <= '0;
+                m_trig_done[s] <= 1'b0;
             end
             f_head <= '0; f_tail <= '0; f_lvl <= '0;
+            occ_q <= '0;
         end else begin
-            // ---- lookup pipeline ----
-            pend_q <= lk_acc;
-            if (lk_acc) begin
-                pend_tok_q  <= lk_token;
-                pend_tag_q  <= lk_addr[31:SETB+OFFB];
-                pend_set_q  <= lk_addr[SETB+OFFB-1:OFFB];
-                pend_word_q <= lk_addr[OFFB-1:2];
-                pend_unc_q  <= cpu_pkg::is_uncached(lk_addr);
+            // ---- lookup pipeline: op register -> pend ----
+            // The bank samples the captured op at this edge; its rdata is valid
+            // in the next cycle, which is exactly when pend_q goes high. A flush
+            // that arrives while the lookup sits in the op register is recorded
+            // here so the pend stage cannot allocate an MSHR for it.
+            pend_q      <= b_read;
+            pend_kill_q <= b_read && flush_valid &&
+                           cpu_pkg::flush_younger(op_tok_q, flush_rob, flush_dtail);
+            if (a_op_valid) begin
+                tag_a_q   <= a_set_fill ? m_tag[b_slot][CTAGB-1:0] : tag_q[acc_set];
+                valid_a_q <= a_set_fill ? 1'b1 : v_q[acc_set];
+            end
+            if (b_read) begin
+                tag_b_q     <= tag_q[op_set_q];
+                pend_tok_q  <= op_tok_q;
+                pend_tag_q  <= op_tag_q[CTAGB-1:0];
+                pend_set_q  <= op_set_q;
+                pend_word_q <= op_word_q;
+                pend_unc_q  <= |op_tag_q[TAGB-1:TAGB-4];   // addr[31:28] != 0
             end
 
             // ---- MSHR kill (flush younger than the flush point) ----
@@ -373,29 +485,34 @@ module dcache (
                         m_wkill[s][w] <= 1'b1;
             end
 
-            // ---- refill write processing ----
-            if (wref) begin
-                if (m_bypass[rslot]) begin
-                    m_valid[rslot] <= 1'b0;
-                    m_wv[rslot]    <= '0;
+            // ---- refill write processing (op-register write stage) ----
+            // The bank write and these state updates happen at the same edge.
+            if (b_refill && m_valid[b_slot]) begin
+                if (m_bypass[b_slot]) begin
+                    m_valid[b_slot] <= 1'b0;
+                    m_wv[b_slot]    <= '0;
                 end else begin
                     logic [NW-1:0] dne;
-                    dne = m_done[rslot] | (ONE_HOT << rword);
-                    m_done[rslot] <= dne;
+                    dne = b_dne;
+                    m_done[b_slot] <= dne;
                     // this word's parked waiter is answered (or was killed) now
-                    m_wv[rslot][rwidx] <= 1'b0;
+                    m_wv[b_slot][b_widx] <= 1'b0;
                     if (dne == ALL_DONE) begin
-                        v_q[m_set[rslot]]   <= 1'b1;
-                        tag_q[m_set[rslot]] <= m_tag[rslot];
-                        m_valid[rslot]      <= 1'b0;
-                        m_wv[rslot]         <= '0;
+                        v_q[m_set[b_slot]]   <= 1'b1;
+                        tag_q[m_set[b_slot]] <= m_tag[b_slot][CTAGB-1:0];
+                        m_valid[b_slot]      <= 1'b0;
+                        m_wv[b_slot]         <= '0;
                     end
                 end
+                if (kw_ev) m_trig_done[b_slot] <= 1'b1;
+                if (b_free) m_trig_done[b_slot] <= 1'b0;
             end
 
             // ---- store-completion invalidate (line may hold a stale fill) ----
-            if (inv_valid && v_q[inv_addr[SETB+OFFB-1:OFFB]] &&
-                (tag_q[inv_addr[SETB+OFFB-1:OFFB]] == inv_addr[31:SETB+OFFB]))
+            // Set-only clear is a safe superset of the tag-matched invalidate:
+            // the store already wrote through, so dropping any line in this set
+            // cannot lose data and only costs a later refill.
+            if (inv_valid && !cpu_pkg::is_uncached(inv_addr))
                 v_q[inv_addr[SETB+OFFB-1:OFFB]] <= 1'b0;
 
             // ---- MSHR allocation (invalidates the set before any fill) ----
@@ -411,6 +528,7 @@ module dcache (
                 m_pushcnt[alloc_slot] <= '0;
                 m_wv[alloc_slot]     <= '0;
                 m_wkill[alloc_slot]  <= '0;
+                m_trig_done[alloc_slot] <= 1'b0;
                 if (!pend_unc) v_q[pend_set_q] <= 1'b0;
             end
 
@@ -427,26 +545,40 @@ module dcache (
             if (rd_push_valid && rd_push_ready)
                 m_pushcnt[push_slot] <= m_pushcnt[push_slot] + 1'b1;
 
+            // ---- capture this cycle's single cache op (A stage) ----
+            op_valid_q  <= op_read_sel || op_refill_sel || op_write_sel;
+            op_read_q   <= op_read_sel;
+            op_refill_q <= op_refill_sel;
+            op_write_q  <= op_write_sel;
+            op_slot_q   <= op_refill_sel ? rslot : 2'd0;
+            op_word_q   <= acc_word;
+            op_set_q    <= acc_set;
+            op_tag_q    <= lk_acc ? lk_addr[31:SETB+OFFB] : su_addr[31:SETB+OFFB];
+            op_tok_q    <= lk_token;
+            op_wdata_q  <= acc_wdata;
+            op_wmask_q  <= acc_wmask;
+
             // ---- response FIFO (up to 3 enqueues: trigger + parked + lookup) ----
             if (ev0) begin
-                f_tok[f_tail] <= ev0_tok;
-                f_dat[f_tail] <= ev0_dat;
-                f_rep[f_tail] <= 1'b0;
+                f_tok[f_pos0] <= ev0_tok;
+                f_dat[f_pos0] <= ev0_dat;
+                f_rep[f_pos0] <= 1'b0;
             end
             if (ev1) begin
-                f_tok[f_tail + {3'b0, ev0}] <= ev1_tok;
-                f_dat[f_tail + {3'b0, ev0}] <= ev1_dat;
-                f_rep[f_tail + {3'b0, ev0}] <= 1'b0;
+                f_tok[f_pos1] <= ev1_tok;
+                f_dat[f_pos1] <= ev1_dat;
+                f_rep[f_pos1] <= 1'b0;
             end
             if (ev2) begin
-                f_tok[f_tail + {3'b0, ev0} + {3'b0, ev1}] <= ev2_tok;
-                f_dat[f_tail + {3'b0, ev0} + {3'b0, ev1}] <= ev2_dat;
-                f_rep[f_tail + {3'b0, ev0} + {3'b0, ev1}] <= ev2_rep;
+                f_tok[f_pos2] <= ev2_tok;
+                f_dat[f_pos2] <= ev2_dat;
+                f_rep[f_pos2] <= ev2_rep;
             end
             if (ev0 || ev1 || ev2)
                 f_tail <= f_tail + {2'b0, ev0} + {2'b0, ev1} + {2'b0, ev2};
-            if (rsp_deq) f_head <= f_head + 4'd1;
-            f_lvl <= f_lvl + {4'b0, ev0} + {4'b0, ev1} + {4'b0, ev2} - {4'b0, rsp_deq};
+            if (rsp_deq) f_head <= f_head + 1'b1;
+            f_lvl <= f_lvl + ev0 + ev1 + ev2 - rsp_deq;
+            occ_q <= occ_q + lk_acc - rsp_deq - rel_trig - rel_park;
         end
     end
 

@@ -93,6 +93,11 @@ module lsu_a (
     logic [RB-1:0] tagrob [0:15];
     logic [31:0] tagaddr [0:15];
     logic        tagmiss [0:15];
+    logic        tw_v;
+    logic [3:0]  tw_tag;
+    logic [31:0] tw_addr;
+    logic [RB-1:0] tw_rob;
+    logic        tw_unc;
 
     wire cur_unc = cpu_pkg::is_uncached(st_req.addr);
     wire su_acc  = dc_su_ready || cur_unc;
@@ -151,6 +156,11 @@ module lsu_a (
             seq_q <= 4'd0;
             sp_v <= 1'b0;
             sp_rob <= 5'd0;
+            tw_v <= 1'b0;
+            tw_tag <= 4'd0;
+            tw_addr <= 32'd0;
+            tw_rob <= '0;
+            tw_unc <= 1'b0;
         end else begin
             // store completion buffer: drains every cycle it is set; a B that
             // cannot be output this cycle (buffer occupied) replaces it
@@ -161,11 +171,19 @@ module lsu_a (
                 sp_v <= 1'b0;
             end
 
+            if (tw_v) begin
+                tagrob[tw_tag]  <= tw_rob;
+                tagaddr[tw_tag] <= tw_addr;
+                tagmiss[tw_tag] <= tw_unc ? 1'b1 : !dc_su_hit;
+                tw_v <= 1'b0;
+            end
             if (drain_go) begin
-                tagrob[seq_q]  <= st_req.rob;
-                tagaddr[seq_q] <= st_req.addr;
-                tagmiss[seq_q] <= cur_unc ? 1'b1 : !dc_su_hit;
-                seq_q <= seq_q + 4'd1;
+                tw_v    <= 1'b1;
+                tw_tag  <= seq_q;
+                tw_addr <= st_req.addr;
+                tw_rob  <= st_req.rob;
+                tw_unc  <= cur_unc;
+                seq_q   <= seq_q + 4'd1;
             end
         end
     end

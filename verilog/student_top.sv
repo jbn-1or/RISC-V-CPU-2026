@@ -49,21 +49,13 @@ module student_top (
     wire             btb_upd_valid;
     wire [31:0]      btb_upd_pc, btb_upd_target;
 
-    // M8b: combinational early redirect (BRU resolve cycle) -> frontend.
-    // The frontend's flush is advanced one cycle (the backend still receives
-    // the registered `flush`), so the PC restarts at the correct target one
-    // cycle earlier while the ROB/IQ/LSU kill protocol is unchanged.
+    // Frequency-first: the frontend consumes the registered flush broadcast
+    // directly instead of the combinational BRU->FE early redirect.  This
+    // removes the BRU/redirect cone from the flush->frontend path and costs
+    // one fetch bubble per mispredict.
     wire             co_redir_valid;
     wire [31:0]      co_redir_pc;
     wire [5:0]       co_redir_bsf;
-
-    cpu_pkg::flush_t fe_flush;
-    always_comb begin
-        fe_flush       = flush;
-        fe_flush.valid = co_redir_valid;
-        fe_flush.pc    = co_redir_pc;
-        fe_flush.bsf   = co_redir_bsf;
-    end
 
     decode u_dec (
         .in_valid_s(fu_dec_valid), .in_pc_s(fu_dec_pc), .in_raw_s(fu_dec_raw),
@@ -78,7 +70,7 @@ module student_top (
     wire [31:0] fu_rsp_data;
 
     fetch_unit u_fe (
-        .clock, .reset, .flush(fe_flush),
+        .clock, .reset, .flush(flush),
         .dec_pc_s(fu_dec_pc), .dec_raw_s(fu_dec_raw), .dec_valid_s(fu_dec_valid),
         .dec_out_valid(dec_ov), .dec_d0(dec_d0), .dec_d1(dec_d1),
         .fe_valid, .fe0, .fe1, .fe_take,
@@ -160,7 +152,7 @@ module student_top (
         .rd_push_valid(ax_rd_v), .rd_push_addr(ax_rd_addr),
         .rd_push_src(ax_rd_src), .rd_push_idx(ax_rd_idx), .rd_push_ready(ax_rd_ready),
         .rd_rsp_valid(ax_rsp_valid), .rd_rsp_src(ax_rsp_src), .rd_rsp_idx(ax_rsp_idx),
-        .rd_rsp_err(), .rd_rsp_data(ax_rsp_data), .rd_rsp_ready(ax_rsp_ready),
+        .rd_rsp_data(ax_rsp_data), .rd_rsp_ready(ax_rsp_ready),
         .wr_push_valid(la_wr_v), .wr_push_addr(la_wr_addr), .wr_push_data(la_wr_data),
         .wr_push_strb(la_wr_strb), .wr_push_tag(la_wr_tag), .wr_push_ready(la_wr_ready),
         .wr_rsp_valid(la_wr_rsp_valid), .wr_rsp_tag(la_wr_rsp_tag),

@@ -7,15 +7,15 @@ package cpu_pkg;
     parameter int ISSUE_WIDTH = 2;      // 发射宽度
     parameter int ROB_DEPTH   = 32;     // S3-4 实测：32→64 回退（qsort -12%）；保持 32
     parameter int PRF_NUM     = 64;     // S3-4 实测：64→128 回退；保持 64
-    parameter int IQ_DEPTH    = 16;     // S3-4 实测：16→32 回退；保持 16
+    parameter int IQ_DEPTH    = 4;      // 频率优先：16→4 缩短选择锥
     // M4: 写回同拍唤醒/操作数旁路（WB->IQ 同拍 CAM 命中即选中，操作数从
     // 写回总线直取）——省掉依赖链的 1 拍唤醒延迟；0 = 关闭（回归基线对照）。
     parameter int WB_BYPASS   = 1;
 
     // ---- 增补参数（references/docs/design.md §3.4）----
     parameter int DECODE_WIDTH = 2;     // 译码/重命名/提交宽度
-    parameter int LDQ_DEPTH    = 8;    // S3-5: 深度 8 足够（16 同 IPC，减半转发 CAM）
-    parameter int STQ_DEPTH    = 16;    // S3-5: 8->16（捕获主要收益 +2.6%；32/64 收益递减但使综合过慢）
+    parameter int LDQ_DEPTH    = 4;    // 频率优先：8→4 缩减转发矩阵
+    parameter int STQ_DEPTH    = 8;     // 频率优先：16→8 缩减 8x16 转发矩阵
     parameter int MUL_LAT      = 4;     // 乘法流水级数
     parameter int DIV_LAT_MAX  = 32;    // 除法迭代上限（radix-2，运行期提前退出）
     parameter int LINE_BYTES   = 32;    // 行大小（16 或 32 B：4/8 × AXI 字）

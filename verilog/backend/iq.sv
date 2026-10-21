@@ -146,6 +146,11 @@ module iq (
     // writeback bus, rob_head and the LSU readiness inputs, never on the selected
     // op (§5A-20).
     logic [D-1:0] lsu_v, lsu_st_v, lsu_elig, lsu_sel;
+    // Frequency-first: issue selection must not depend on the combinational
+    // flush kill mask.  On a flush cycle the whole issue port is suppressed
+    // for one cycle (issue_en), which is enough to keep LSU allocations out of
+    // the flush window; older entries simply issue after the flush cycle.
+    wire          issue_en = !flush_valid;
     always_comb begin
         logic found;
         logic [RB-1:0] best;
@@ -156,7 +161,7 @@ module iq (
         lsu_v = '0; lsu_st_v = '0; lsu_elig = '0; lsu_sel = '0;
         found = 1'b0; best = '0; bi = '0;
         for (int i = 0; i < D; i = i + 1) begin
-            lsu_v[i]    = v_q[i] && (fu_q[i] == cpu_pkg::FU_LSU) && !kill[i];
+            lsu_v[i]    = v_q[i] && (fu_q[i] == cpu_pkg::FU_LSU);
             lsu_st_v[i] = lsu_v[i] && st_ent_q[i];
             if (lsu_st_v[i] && (!found || ((rob_q[i] - rob_head) < best))) begin
                 best = rob_q[i] - rob_head;
@@ -209,7 +214,7 @@ module iq (
             // WB bypass: an operand wired to this cycle's qualified writeback is
             // usable immediately (the value is taken from the bus in core_ooo).
             // M8 (§16.4): stores issue on address (rs1) readiness alone.
-            ok = v_q[i] && !kill[i] &&
+            ok = v_q[i] && issue_en &&
                  (r1_q[i] || ((cpu_pkg::WB_BYPASS != 0) && r1_set[i])) &&
                  (st_ent_q[i] || r2_q[i] || ((cpu_pkg::WB_BYPASS != 0) && r2_set[i]));
             port = cpu_pkg::IUP_ALU0;
