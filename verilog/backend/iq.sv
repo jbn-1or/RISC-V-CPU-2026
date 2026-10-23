@@ -74,7 +74,13 @@ module iq (
         for (int i = D-1; i >= 0; i = i - 1)
             if (f[i]) lowest = i[SB-1:0];
     endfunction
-    wire [D-1:0] freeslot = ~v_q;
+    logic s0v, s1v;
+    logic [SB-1:0] s0, s1;
+    wire [D-1:0] issued_mask = (s0v ? (ONE << s0) : '0) |
+                                 (s1v ? (ONE << s1) : '0);
+    // Entries read by issue leave at this edge, so dispatch can reuse their
+    // slots without enlarging the wakeup/selection window.
+    wire [D-1:0] freeslot = ~v_q | issued_mask;
     wire [SB-1:0] pos0 = lowest(freeslot);
     logic [D-1:0] st_ent_q;   // per-entry "is store" bit (packed: Yosys-safe)
     wire [SB-1:0] pos1 = lowest(freeslot & ~(ONE << pos0));
@@ -85,7 +91,7 @@ module iq (
         for (int i = 0; i < D; i = i + 1)
             used_cnt = used_cnt + {{(SPW-1){1'b0}}, v_q[i]};
     end
-    assign space = DCAP - used_cnt;
+    assign space = DCAP - used_cnt + SPW'(s0v) + SPW'(s1v);
 
     // ---------------- flush kill set ----------------
     logic [D-1:0] kill;
@@ -198,8 +204,6 @@ module iq (
     end
 
     // ---------------- issue selection ----------------
-    logic        s0v, s1v;
-    logic [SB-1:0] s0, s1;
     always_comb begin
         logic a0, a1, bru, mul, div, lsu_ld, lsu_st;
         logic [SB-1:0] i;
@@ -332,7 +336,8 @@ module iq (
             end
             // wakeup
             for (int i = 0; i < D; i = i + 1) begin
-                if (v_q[i]) begin
+                if (v_q[i] && !(disp_valid[0] && pos0 == i[SB-1:0]) &&
+                              !(disp_valid[1] && pos1 == i[SB-1:0])) begin
                     if (r1_set[i]) r1_q[i] <= 1'b1;
                     if (r2_set[i]) r2_q[i] <= 1'b1;
                 end

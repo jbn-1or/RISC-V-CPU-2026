@@ -61,7 +61,7 @@ module lsu_a (
 );
     // ---------------- D$ ----------------
     localparam int RB = $clog2(cpu_pkg::ROB_DEPTH);
-    wire        dc_lk_ready, dc_rsp_valid, dc_rsp_replay, dc_su_ready, dc_su_hit;
+    wire        dc_lk_ready, dc_rsp_valid, dc_rsp_replay, dc_su_ready, dc_su_hit, dc_su_stall;
     wire [RB-1:0] dc_rsp_token;
     wire [31:0] dc_rsp_data;
     logic       inv_valid;
@@ -75,7 +75,7 @@ module lsu_a (
         .rsp_valid(dc_rsp_valid), .rsp_token(dc_rsp_token), .rsp_data(dc_rsp_data),
         .rsp_replay(dc_rsp_replay), .rsp_ready(dc_rsp_sel_q),
         .su_valid(su_valid), .su_addr(su_addr), .su_data(su_data), .su_strb(su_strb),
-        .su_ready(dc_su_ready), .su_hit(dc_su_hit),
+        .su_ready(dc_su_ready), .su_hit(dc_su_hit), .su_stall(dc_su_stall),
         .inv_valid, .inv_addr,
         .flush_valid, .flush_rob, .flush_dtail,
         .rd_push_valid, .rd_push_addr, .rd_push_idx, .rd_push_ready,
@@ -100,12 +100,16 @@ module lsu_a (
     logic        tw_unc;
 
     wire cur_unc = cpu_pkg::is_uncached(st_req.addr);
-    wire su_acc  = dc_su_ready || cur_unc;
+    // The D$ hit-update and the AXI write push must be accepted together: the
+    // tagmiss captured for the store is read from the D$ one cycle later, so a
+    // D$ update that the AXI queue did not accept would desynchronise the tag
+    // table. Gate the D$ update on wr_push_ready as well.
+    wire su_acc  = (dc_su_ready && wr_push_ready && !dc_su_stall) || cur_unc;
     assign wr_push_valid = st_valid && su_acc;
     wire drain_go = wr_push_valid && wr_push_ready;
     assign st_ready = drain_go;
 
-    wire su_valid = st_valid && !cur_unc;
+    wire su_valid = st_valid && !cur_unc && wr_push_ready && !dc_su_stall;
     wire [31:0] su_addr  = st_req.addr;
     wire [31:0] su_data  = st_req.wdata;
     wire [3:0]  su_strb  = st_req.wstrb;

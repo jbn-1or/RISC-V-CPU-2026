@@ -109,7 +109,10 @@ module axi_master (
     logic [3:0]  tq_head, tq_tail;
 
     wire [71:0] wrq_head_val = wrq_mem[wrq_head];
-    wire iss_load = (iss_valid == 1'b0) && (wrq_cnt != 5'd0) && (bwait_cnt < WR_CAP);
+    // Complete the current pair and replace it at the same edge. AW and W
+    // remain independent: a channel that already fired stays deasserted
+    // until the other channel also finishes, keeping stalled payload stable.
+    wire iss_load = (!iss_valid || pair_done) && (wrq_cnt != 5'd0) && (bwait_cnt < WR_CAP);
 
     wire [31:0] wr_usage32 = {27'b0, wrq_cnt} + {27'b0, bwait_cnt} + {31'b0, iss_valid};
     assign wr_push_ready = !reset && $unsigned(wr_usage32) < cpu_pkg::AXI_MAX_WR;
@@ -121,7 +124,8 @@ module axi_master (
     assign wstrb   = iss_strb;
     wire aw_fire = awvalid && awready;
     wire w_fire  = wvalid  && wready;
-    wire pair_done = iss_valid && aw_fire_d && w_fire_d;
+    wire pair_done = iss_valid && (aw_fire_d || aw_fire) &&
+                                  (w_fire_d || w_fire);
 
     wire [3:0] tq_head_val = tq_mem[tq_head];
     assign wr_rsp_valid = bvalid;

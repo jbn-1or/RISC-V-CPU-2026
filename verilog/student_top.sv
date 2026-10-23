@@ -49,13 +49,21 @@ module student_top (
     wire             btb_upd_valid;
     wire [31:0]      btb_upd_pc, btb_upd_target;
 
-    // Frequency-first: the frontend consumes the registered flush broadcast
-    // directly instead of the combinational BRU->FE early redirect.  This
-    // removes the BRU/redirect cone from the flush->frontend path and costs
-    // one fetch bubble per mispredict.
     wire             co_redir_valid;
     wire [31:0]      co_redir_pc;
     wire [5:0]       co_redir_bsf;
+
+    // M8b: combinational early redirect (BRU resolve cycle) -> frontend.
+    // The frontend's flush is advanced one cycle (the backend still receives
+    // the registered `flush`), so the PC restarts at the correct target one
+    // cycle earlier while the ROB/IQ/LSU kill protocol is unchanged.
+    cpu_pkg::flush_t fe_flush;
+    always_comb begin
+        fe_flush       = flush;
+        fe_flush.valid = co_redir_valid;
+        fe_flush.pc    = co_redir_pc;
+        fe_flush.bsf   = co_redir_bsf;
+    end
 
     decode u_dec (
         .in_valid_s(fu_dec_valid), .in_pc_s(fu_dec_pc), .in_raw_s(fu_dec_raw),
@@ -70,7 +78,7 @@ module student_top (
     wire [31:0] fu_rsp_data;
 
     fetch_unit u_fe (
-        .clock, .reset, .flush(flush),
+        .clock, .reset, .flush(fe_flush),
         .dec_pc_s(fu_dec_pc), .dec_raw_s(fu_dec_raw), .dec_valid_s(fu_dec_valid),
         .dec_out_valid(dec_ov), .dec_d0(dec_d0), .dec_d1(dec_d1),
         .fe_valid, .fe0, .fe1, .fe_take,

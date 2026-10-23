@@ -59,6 +59,7 @@ module dcache (
     input  wire [3:0]  su_strb,
     output wire        su_ready,
     output wire        su_hit,
+    output wire        su_stall,     // set has an in-flight fill; store must wait
 
     // store-completion line invalidate (stale-fill cleanup, see lsu_a)
     input  wire        inv_valid,
@@ -174,13 +175,17 @@ module dcache (
     logic [RB-1:0] f_tok [0:FD-1];
     logic [31:0] f_dat [0:FD-1];
     logic        f_rep [0:FD-1];
+    logic        f_kill[0:FD-1];   // flushed entry: pop without a response
     logic [FW-1:0] f_head, f_tail;
     logic [FL-1:0] f_lvl;
-    assign rsp_valid  = (f_lvl != '0);
-    assign rsp_token  = f_tok[f_head];
-    assign rsp_data   = f_dat[f_head];
-    assign rsp_replay = f_rep[f_head];
-    wire   rsp_deq    = (f_lvl != '0) && rsp_ready;
+    wire f_skip = (f_lvl != '0) && f_kill[f_head];
+    wire fifo_rsp = (f_lvl != '0) && !f_skip;
+    wire fast_rsp, fast_deq;
+    assign rsp_valid = fifo_rsp || fast_rsp;
+    assign rsp_token = fast_rsp ? ev2_tok : f_tok[f_head];
+    assign rsp_data = fast_rsp ? ev2_dat : f_dat[f_head];
+    assign rsp_replay = fast_rsp ? 1'b0 : f_rep[f_head];
+    wire rsp_deq = fifo_rsp && rsp_ready;
 
     // ---------------- shared SRAM input op register ----------------
     // Exactly one cache operation (refill write, load lookup, or store
@@ -252,6 +257,18 @@ module dcache (
     wire b_wr_hit = b_store_wr && valid_a_q &&
                     (tag_a_q == op_tag_q[CTAGB-1:0]);
     assign su_hit = b_wr_hit;
+
+    // A store must not update/invalidate a line while a refill for the same set
+    // is in flight: the fill could otherwise publish data read before this
+    // store's write-through. Waiting one fill is cheaper than an epoch table.
+    logic su_set_busy;
+    always_comb begin
+        su_set_busy = 1'b0;
+        for (int s = 0; s < MN; s = s + 1)
+            if (m_valid[s] && (m_set[s] == su_addr[SETB+OFFB-1:OFFB]))
+                su_set_busy = 1'b1;
+    end
+    assign su_stall = su_set_busy;
 
     // A stage: select the single operation for this cycle and capture it.
     wire [2:0]      acc_word = lk_acc ? lk_addr[OFFB-1:2] :
@@ -363,6 +380,11 @@ module dcache (
     wire mg_now  = mg_cand && b_refill_wr && (b_slot == mg_slot) && (b_widx == pend_widx);
     // park only when this word's single waiter slot is free
     wire mg_reg  = mg_cand && !mg_now && !m_wv[mg_slot][pend_widx];
+    // A flushed lookup must produce NO response at all.  A replay would be
+    // harmless, but a hit would put the old rob token back into the FIFO; if
+    // that token is reused before the FIFO drains, a younger load consumes
+    // stale data.  Drop the reservation instead.
+    wire pend_drop = pend_q && pend_kill;
 
     // keyword completion (trigger word arrived, waiter still alive)
     wire kw_ev = b_refill && m_valid[b_slot] && (b_widx == m_trig[b_slot][WB-1:0]) &&
@@ -389,10 +411,17 @@ module dcache (
     wire ev1 = park_ev;
     wire [RB-1:0] ev1_tok = m_wt[b_slot][b_widx];
     wire [31:0]   ev1_dat = op_wdata_q;
-    wire ev2 = pend_pok || mg_now || (pend_miss && !alloc_en && !mg_reg && !mg_now);
+    wire ev2 = !pend_drop &&
+               (pend_pok || mg_now || (pend_miss && !alloc_en && !mg_reg && !mg_now));
     wire [RB-1:0] ev2_tok = pend_tok_q;
     wire [31:0]   ev2_dat = pend_pok ? bank_data : (mg_now ? op_wdata_q : 32'b0);
     wire          ev2_rep = !(pend_pok || mg_now);
+
+    // Bypass the empty FIFO for one completed lookup. A stalled response
+    // is captured normally, so its payload survives output backpressure.
+    assign fast_rsp = (f_lvl == 0) && !ev0 && !ev1 && ev2 && !ev2_rep;
+    assign fast_deq = fast_rsp && rsp_ready;
+    wire enq2 = ev2 && !fast_deq;
 
     // Write positions wrap modulo FD (FD is a power of two).
     wire [FW-1:0] f_pos0 = f_tail;
@@ -404,7 +433,7 @@ module dcache (
     // The FIFO bound is an invariant; catch any violation (a lost or
     // duplicated event) at the cycle it happens instead of corrupting data.
     always_ff @(posedge clock)
-        if (!reset && (({1'b0, f_lvl} + ev0 + ev1 + ev2) > 6'(FD)))
+        if (!reset && (({1'b0, f_lvl} + ev0 + ev1 + enq2) > 6'(FD)))
             $fatal(1, "dcache: response FIFO overflow");
     // occ_q must always equal FIFO occupancy plus all outstanding
     // reservations (op/pend lookups, live triggers, occupied park slots).
@@ -451,6 +480,7 @@ module dcache (
                 m_trig_done[s] <= 1'b0;
             end
             f_head <= '0; f_tail <= '0; f_lvl <= '0;
+            for (int k = 0; k < FD; k = k + 1) f_kill[k] <= 1'b0;
             occ_q <= '0;
         end else begin
             // ---- lookup pipeline: op register -> pend ----
@@ -508,13 +538,6 @@ module dcache (
                 if (b_free) m_trig_done[b_slot] <= 1'b0;
             end
 
-            // ---- store-completion invalidate (line may hold a stale fill) ----
-            // Set-only clear is a safe superset of the tag-matched invalidate:
-            // the store already wrote through, so dropping any line in this set
-            // cannot lose data and only costs a later refill.
-            if (inv_valid && !cpu_pkg::is_uncached(inv_addr))
-                v_q[inv_addr[SETB+OFFB-1:OFFB]] <= 1'b0;
-
             // ---- MSHR allocation (invalidates the set before any fill) ----
             if (alloc_en) begin
                 m_valid[alloc_slot]  <= 1'b1;
@@ -531,6 +554,13 @@ module dcache (
                 m_trig_done[alloc_slot] <= 1'b0;
                 if (!pend_unc) v_q[pend_set_q] <= 1'b0;
             end
+
+            // ---- store-completion invalidate (line may hold a stale fill) ----
+            // Set-only clear is a safe superset of the tag-matched invalidate:
+            // the store already wrote through, so dropping any line in this set
+            // cannot lose data and only costs a later refill.
+            if (inv_valid && !cpu_pkg::is_uncached(inv_addr))
+                v_q[inv_addr[SETB+OFFB-1:OFFB]] <= 1'b0;
 
             // ---- P0-mwaiter: park the pending lookup's token ----
             // Gated by pend_kill: a token flushed while registering would not be
@@ -563,22 +593,36 @@ module dcache (
                 f_tok[f_pos0] <= ev0_tok;
                 f_dat[f_pos0] <= ev0_dat;
                 f_rep[f_pos0] <= 1'b0;
+                f_kill[f_pos0] <= 1'b0;
             end
             if (ev1) begin
                 f_tok[f_pos1] <= ev1_tok;
                 f_dat[f_pos1] <= ev1_dat;
                 f_rep[f_pos1] <= 1'b0;
+                f_kill[f_pos1] <= 1'b0;
             end
-            if (ev2) begin
+            if (enq2) begin
                 f_tok[f_pos2] <= ev2_tok;
                 f_dat[f_pos2] <= ev2_dat;
                 f_rep[f_pos2] <= ev2_rep;
+                f_kill[f_pos2] <= 1'b0;
             end
-            if (ev0 || ev1 || ev2)
-                f_tail <= f_tail + {2'b0, ev0} + {2'b0, ev1} + {2'b0, ev2};
-            if (rsp_deq) f_head <= f_head + 1'b1;
-            f_lvl <= f_lvl + ev0 + ev1 + ev2 - rsp_deq;
-            occ_q <= occ_q + lk_acc - rsp_deq - rel_trig - rel_park;
+            if (ev0 || ev1 || enq2)
+                f_tail <= f_tail + {2'b0, ev0} + {2'b0, ev1} + {2'b0, enq2};
+            // A response already sitting in the FIFO when its load is flushed
+            // carries that load's rob token.  Mark it dead so it is popped
+            // without being matched by a younger load that reuses the token.
+            if (flush_valid)
+                for (int k = 0; k < FD; k = k + 1) begin
+                    logic [FW-1:0] idx;
+                    idx = f_head + k[FW-1:0];
+                    if ((k < f_lvl) &&
+                        cpu_pkg::flush_younger(f_tok[idx], flush_rob, flush_dtail))
+                        f_kill[idx] <= 1'b1;
+                end
+            if (rsp_deq || f_skip) f_head <= f_head + 1'b1;
+            f_lvl <= f_lvl + ev0 + ev1 + enq2 - rsp_deq - f_skip;
+            occ_q <= occ_q + lk_acc - rsp_deq - fast_deq - f_skip - rel_trig - rel_park - pend_drop;
         end
     end
 
