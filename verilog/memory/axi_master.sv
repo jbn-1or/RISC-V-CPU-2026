@@ -112,7 +112,13 @@ module axi_master (
     // Complete the current pair and replace it at the same edge. AW and W
     // remain independent: a channel that already fired stays deasserted
     // until the other channel also finishes, keeping stalled payload stable.
-    wire iss_load = (!iss_valid || pair_done) && (wrq_cnt != 5'd0) && (bwait_cnt < WR_CAP);
+    wire iss_room = (!iss_valid || pair_done) && (bwait_cnt < WR_CAP);
+    wire direct_write = iss_room && (wrq_cnt == 0) && wr_accept;
+    wire iss_load = iss_room && ((wrq_cnt != 0) || wr_accept);
+    wire wrq_push = wr_accept && !direct_write;
+    wire wrq_pop = iss_load && (wrq_cnt != 0);
+    wire [71:0] iss_payload = (wrq_cnt != 0) ? wrq_head_val :
+        {wr_push_addr, wr_push_data, wr_push_strb, wr_push_tag};
 
     wire [31:0] wr_usage32 = {27'b0, wrq_cnt} + {27'b0, bwait_cnt} + {31'b0, iss_valid};
     assign wr_push_ready = !reset && $unsigned(wr_usage32) < cpu_pkg::AXI_MAX_WR;
@@ -179,12 +185,12 @@ module axi_master (
                 default: ;
             endcase
             // ---- write queue ----
-            if (wr_accept) begin
+            if (wrq_push) begin
                 wrq_mem[wrq_tail] <= wrq_wdata;
                 wrq_tail <= wrq_tail + 3'd1;
             end
-            if (iss_load) wrq_head <= wrq_head + 3'd1;
-            case ({wr_accept, iss_load})
+            if (wrq_pop) wrq_head <= wrq_head + 3'd1;
+            case ({wrq_push, wrq_pop})
                 2'b10: wrq_cnt <= wrq_cnt + 5'd1;
                 2'b01: wrq_cnt <= wrq_cnt - 5'd1;
                 default: ;
@@ -192,12 +198,12 @@ module axi_master (
             // ---- write issue stage ----
             if (iss_load) begin
                 iss_valid <= 1'b1;
-                iss_addr  <= wrq_head_val[71:40];
-                iss_data  <= wrq_head_val[39:8];
-                iss_strb  <= wrq_head_val[7:4];
+                iss_addr  <= iss_payload[71:40];
+                iss_data  <= iss_payload[39:8];
+                iss_strb  <= iss_payload[7:4];
                 aw_fire_d <= 1'b0;
                 w_fire_d  <= 1'b0;
-                tq_mem[tq_tail] <= wrq_head_val[3:0];
+                tq_mem[tq_tail] <= iss_payload[3:0];
                 tq_tail <= tq_tail + 4'd1;
             end else if (iss_valid) begin
                 if (aw_fire) aw_fire_d <= 1'b1;

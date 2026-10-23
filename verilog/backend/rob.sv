@@ -93,9 +93,8 @@ module rob (
     logic [cpu_pkg::ROB_DEPTH-1:0] kill_comb;
     always_comb begin
         kill_comb = '0;
-        for (int n = 0; n < cpu_pkg::ROB_DEPTH; n = n + 1)
-            if (cpu_pkg::flush_younger(flush_rob + n[RB-1:0], flush_rob, dtail))
-                kill_comb[flush_rob + n[RB-1:0]] = 1'b1;
+        for (int i = 0; i < cpu_pkg::ROB_DEPTH; i = i + 1)
+            kill_comb[i] = cpu_pkg::flush_younger(i[RB-1:0], flush_rob, dtail);
     end
     wire [cpu_pkg::ROB_DEPTH-1:0] kkill = flush_valid ? kill_comb : '0;
 
@@ -142,13 +141,14 @@ module rob (
     always_comb begin
         flush_free_mask = '0;
         flush_pend_mask = '0;
-        for (int i = 0; i < cpu_pkg::ROB_DEPTH; i = i + 1) begin
-            if (kkill[i] && (rd_q[i] != 5'd0)) begin
-                // reclaimed only if a writeback can still arrive for this tag:
-                // issued, not done, and not a load (killed loads are discarded).
-                if (d_q[i] || !iss_q[i] || ld_q[i])
-                     flush_free_mask |= (ONE << pdst_q[i]);
-                else flush_pend_mask |= (ONE << pdst_q[i]);
+        // Decode tags to constant bit positions. This avoids a bank of
+        // variable shifts that makes resource-sharing SAT grow quadratically.
+        for (int p = 1; p < cpu_pkg::PRF_NUM; p = p + 1) begin
+            for (int i = 0; i < cpu_pkg::ROB_DEPTH; i = i + 1) begin
+                if (kkill[i] && (rd_q[i] != 0) && (pdst_q[i] == p[PB-1:0])) begin
+                    if (d_q[i] || !iss_q[i] || ld_q[i]) flush_free_mask[p] = 1'b1;
+                    else flush_pend_mask[p] = 1'b1;
+                end
             end
         end
     end

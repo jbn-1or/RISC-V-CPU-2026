@@ -127,9 +127,17 @@ module dcache (
     // in the same flop stage as the SRAM data output, so the 1024:1 tag mux is
     // not in the pend-evaluation cycle. The valid bit stays a live read
     // (v_q one-bit mux) so a same-cycle invalidate/alloc clear still wins.
-    logic [CTAGB-1:0] tag_a_q;
-    logic            valid_a_q;
-    logic [CTAGB-1:0] tag_b_q;
+    // Split the tag mux across the existing op/pend stages. Each A bank
+    // reads 1/4 of the rows; B selects the bank without another tag-array read.
+    localparam int TBB = (SETB >= 2) ? 2 : 0;
+    localparam int TBN = 1 << TBB;
+    localparam int TRB = SETB - TBB;
+    logic [CTAGB-1:0] tag_a_bank_q [0:TBN-1];
+    logic [TBN-1:0] valid_a_bank_q;
+    wire [CTAGB-1:0] tag_a_q = tag_a_bank_q[op_set_q >> TRB];
+    wire valid_a_q = valid_a_bank_q[op_set_q >> TRB];
+    logic [CTAGB-1:0] tag_b_bank_q [0:TBN-1];
+    wire [CTAGB-1:0] tag_b_q = tag_b_bank_q[pend_set_q >> TRB];
     logic            pend_q;
     logic [RB-1:0]   pend_tok_q;
     logic [CTAGB-1:0] pend_tag_q;
@@ -182,8 +190,8 @@ module dcache (
     wire fifo_rsp = (f_lvl != '0) && !f_skip;
     wire fast_rsp, fast_deq;
     assign rsp_valid = fifo_rsp || fast_rsp;
-    assign rsp_token = fast_rsp ? ev2_tok : f_tok[f_head];
-    assign rsp_data = fast_rsp ? ev2_dat : f_dat[f_head];
+    assign rsp_token = fast_rsp ? (ev0 ? ev0_tok : (ev1 ? ev1_tok : ev2_tok)) : f_tok[f_head];
+    assign rsp_data = fast_rsp ? (ev0 ? ev0_dat : (ev1 ? ev1_dat : ev2_dat)) : f_dat[f_head];
     assign rsp_replay = fast_rsp ? 1'b0 : f_rep[f_head];
     wire rsp_deq = fifo_rsp && rsp_ready;
 
@@ -419,8 +427,13 @@ module dcache (
 
     // Bypass the empty FIFO for one completed lookup. A stalled response
     // is captured normally, so its payload survives output backpressure.
-    assign fast_rsp = (f_lvl == 0) && !ev0 && !ev1 && ev2 && !ev2_rep;
+    wire one_event = ({ev0,ev1,ev2} == 3'b100) ||
+                     ({ev0,ev1,ev2} == 3'b010) ||
+                     ({ev0,ev1,ev2} == 3'b001 && !ev2_rep);
+    assign fast_rsp = (f_lvl == 0) && one_event;
     assign fast_deq = fast_rsp && rsp_ready;
+    wire enq0 = ev0 && !fast_deq;
+    wire enq1 = ev1 && !fast_deq;
     wire enq2 = ev2 && !fast_deq;
 
     // Write positions wrap modulo FD (FD is a power of two).
@@ -433,7 +446,7 @@ module dcache (
     // The FIFO bound is an invariant; catch any violation (a lost or
     // duplicated event) at the cycle it happens instead of corrupting data.
     always_ff @(posedge clock)
-        if (!reset && (({1'b0, f_lvl} + ev0 + ev1 + enq2) > 6'(FD)))
+        if (!reset && (({1'b0, f_lvl} + enq0 + enq1 + enq2) > 6'(FD)))
             $fatal(1, "dcache: response FIFO overflow");
     // occ_q must always equal FIFO occupancy plus all outstanding
     // reservations (op/pend lookups, live triggers, occupied park slots).
@@ -453,9 +466,9 @@ module dcache (
     always_ff @(posedge clock) begin
         if (reset) begin
             v_q <= '0;
-            tag_a_q <= '0;
-            valid_a_q <= 1'b0;
-            tag_b_q <= '0;
+            for (int b = 0; b < TBN; b = b + 1) tag_a_bank_q[b] <= '0;
+            valid_a_bank_q <= '0;
+            for (int b = 0; b < TBN; b = b + 1) tag_b_bank_q[b] <= '0;
             pend_q <= 1'b0;
             pend_unc_q <= 1'b0;
             pend_kill_q <= 1'b0;
@@ -491,12 +504,27 @@ module dcache (
             pend_q      <= b_read;
             pend_kill_q <= b_read && flush_valid &&
                            cpu_pkg::flush_younger(op_tok_q, flush_rob, flush_dtail);
-            if (a_op_valid) begin
-                tag_a_q   <= a_set_fill ? m_tag[b_slot][CTAGB-1:0] : tag_q[acc_set];
-                valid_a_q <= a_set_fill ? 1'b1 : v_q[acc_set];
+            // Store tags read directly from the drain address, without the
+            // load/store/refill input arbitration mux in their address path.
+            if (su_acc) begin
+                for (int b = 0; b < TBN; b = b + 1) begin
+                    tag_a_bank_q[b] <= tag_q[SETB'((b << TRB) | int'(su_addr[OFFB+TRB-1:OFFB]))];
+                    valid_a_bank_q[b] <= v_q[SETB'((b << TRB) | int'(su_addr[OFFB+TRB-1:OFFB]))];
+                    // Forward a fill published at the same edge as the A read.
+                    // These are the only writes to tag_q, so B sees the same
+                    // tag as a fresh read of tag_q[op_set_q] one cycle later.
+                    if (a_set_fill && (int'(acc_set >> TRB) == b)) begin
+                        tag_a_bank_q[b] <= m_tag[b_slot][CTAGB-1:0];
+                        valid_a_bank_q[b] <= 1'b1;
+                    end
+                end
             end
             if (b_read) begin
-                tag_b_q     <= tag_q[op_set_q];
+                // Load tag reads use the registered op address. The bank
+                // select is evaluated in the response stage, retaining the
+                // same SRAM/lookup latency as the unbanked B-stage read.
+                for (int b = 0; b < TBN; b = b + 1)
+                    tag_b_bank_q[b] <= tag_q[SETB'((b << TRB) | int'(op_set_q[TRB-1:0]))];
                 pend_tok_q  <= op_tok_q;
                 pend_tag_q  <= op_tag_q[CTAGB-1:0];
                 pend_set_q  <= op_set_q;
@@ -589,13 +617,13 @@ module dcache (
             op_wmask_q  <= acc_wmask;
 
             // ---- response FIFO (up to 3 enqueues: trigger + parked + lookup) ----
-            if (ev0) begin
+            if (enq0) begin
                 f_tok[f_pos0] <= ev0_tok;
                 f_dat[f_pos0] <= ev0_dat;
                 f_rep[f_pos0] <= 1'b0;
                 f_kill[f_pos0] <= 1'b0;
             end
-            if (ev1) begin
+            if (enq1) begin
                 f_tok[f_pos1] <= ev1_tok;
                 f_dat[f_pos1] <= ev1_dat;
                 f_rep[f_pos1] <= 1'b0;
@@ -607,8 +635,8 @@ module dcache (
                 f_rep[f_pos2] <= ev2_rep;
                 f_kill[f_pos2] <= 1'b0;
             end
-            if (ev0 || ev1 || enq2)
-                f_tail <= f_tail + {2'b0, ev0} + {2'b0, ev1} + {2'b0, enq2};
+            if (enq0 || enq1 || enq2)
+                f_tail <= f_tail + {2'b0, enq0} + {2'b0, enq1} + {2'b0, enq2};
             // A response already sitting in the FIFO when its load is flushed
             // carries that load's rob token.  Mark it dead so it is popped
             // without being matched by a younger load that reuses the token.
@@ -621,7 +649,7 @@ module dcache (
                         f_kill[idx] <= 1'b1;
                 end
             if (rsp_deq || f_skip) f_head <= f_head + 1'b1;
-            f_lvl <= f_lvl + ev0 + ev1 + enq2 - rsp_deq - f_skip;
+            f_lvl <= f_lvl + enq0 + enq1 + enq2 - rsp_deq - f_skip;
             occ_q <= occ_q + lk_acc - rsp_deq - fast_deq - f_skip - rel_trig - rel_park - pend_drop;
         end
     end

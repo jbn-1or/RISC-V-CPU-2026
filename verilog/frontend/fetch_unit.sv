@@ -17,6 +17,7 @@ module fetch_unit (
     input  wire        reset,
 
     input  cpu_pkg::flush_t flush,
+    input wire [31:0] flush_next_pc,
 
     // decode interface (combinational loop with the decode module)
     output wire [63:0] dec_pc_s,
@@ -195,10 +196,10 @@ module fetch_unit (
         .s1_hit(bp_s1_hit), .s1_top(bp_s1_top));
 
     // ---------------- IFB ----------------
-    cpu_pkg::fe2rn_t ifb_mem [0:15];
-    logic [5:0]  ifb_bsf [0:15];  // parallel bsf for variable-index flush scan
-    logic [3:0]  ifb_head, ifb_tail;
-    logic [4:0]  ifb_cnt;
+    cpu_pkg::fe2rn_t ifb_mem [0:7];
+    logic [5:0]  ifb_bsf [0:7];   // parallel bsf for variable-index flush scan
+    logic [2:0]  ifb_head, ifb_tail;
+    logic [3:0]  ifb_cnt;
 
     wire A_valid = push0 || push1;
     wire B_valid = push0 && push1;
@@ -208,9 +209,9 @@ module fetch_unit (
 
     assign fe_valid = { (ifb_cnt >= 4'd2), (ifb_cnt >= 4'd1) };
     assign fe0 = ifb_mem[ifb_head];
-    assign fe1 = ifb_mem[ifb_head + 4'd1];
+    assign fe1 = ifb_mem[ifb_head + 3'd1];
 
-    wire ifb_ok = (ifb_cnt + {3'b0, n_push}) <= 5'd14;
+    wire ifb_ok = (ifb_cnt + {2'b0, n_push}) <= 4'd6;
     // S3-2/S3-3: neither `redirect` nor `flush` suppresses the request; their
     // targets are requested in the same cycle via req_pc. A miss still stalls
     // (its block is re-requested after the refill), and a busy port or a full
@@ -239,27 +240,27 @@ module fetch_unit (
     wire [5:0] B_bsf = first_bsf + {5'b0, dec_d0.is_branch};
 
     // flush drop: cut the IFB tail at the first younger entry (valid range only)
-    logic [3:0] cut;
+    logic [2:0] cut;
     always_comb begin
         logic found;
         cut = ifb_tail;
         found = 1'b0;
-        for (int k = 0; k < 16; k = k + 1) begin
-            logic [3:0] i;
+        for (int k = 0; k < 8; k = k + 1) begin
+            logic [2:0] i;
             logic [5:0] dvec;
-            i = ifb_head + k[3:0];
+            i = ifb_head + k[2:0];
             dvec = ifb_bsf[i] - flush.bsf;
-            if (!found && (k[4:0] < ifb_cnt) && (dvec != 6'd0) && (dvec <= 6'd32)) begin
+            if (!found && (k[3:0] < ifb_cnt) && (dvec != 6'd0) && (dvec <= 6'd32)) begin
                 cut = i;
                 found = 1'b1;
             end
         end
     end
-    wire [4:0] cnt_after_cut = cut - ifb_head;
+    wire [3:0] cnt_after_cut = cut - ifb_head;
 
     always_ff @(posedge clock) begin
         if (reset) begin
-            ifb_head <= 4'd0; ifb_tail <= 4'd0; ifb_cnt <= 5'd0;
+            ifb_head <= 3'd0; ifb_tail <= 3'd0; ifb_cnt <= 4'd0;
             pc_r <= 32'd0; half_r <= 1'b0; bsf_r <= 6'd0;
             r_pend_q <= 1'b0; r_pc_q <= 32'd0; r_half_q <= 1'b0;
         end else begin
@@ -274,7 +275,7 @@ module fetch_unit (
                 // S3-3: if the flush-target request was issued this cycle,
                 // advance past it; otherwise restart at the target next cycle.
                 if (issue_ok) begin
-                    pc_r   <= (flush.pc & 32'hfffffff8) + 32'd8;
+                    pc_r   <= flush_next_pc;
                     half_r <= 1'b0;
                 end else begin
                     pc_r   <= flush.pc & 32'hfffffff8;
@@ -319,10 +320,10 @@ module fetch_unit (
                 end
             end else begin
                 if (A_valid) begin ifb_mem[ifb_tail] <= eA; ifb_bsf[ifb_tail] <= eA.bsf; end
-                if (B_valid) begin ifb_mem[ifb_tail + 4'd1] <= eB; ifb_bsf[ifb_tail + 4'd1] <= eB.bsf; end
+                if (B_valid) begin ifb_mem[ifb_tail + 3'd1] <= eB; ifb_bsf[ifb_tail + 3'd1] <= eB.bsf; end
                 ifb_tail <= ifb_tail + n_push;
                 ifb_head <= ifb_head + n_pop;
-                ifb_cnt  <= ifb_cnt + {3'b0, n_push} - {3'b0, n_pop};
+                ifb_cnt  <= ifb_cnt + {2'b0, n_push} - {2'b0, n_pop};
             end
         end
     end

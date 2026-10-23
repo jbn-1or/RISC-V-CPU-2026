@@ -50,7 +50,7 @@ module student_top (
     wire [31:0]      btb_upd_pc, btb_upd_target;
 
     wire             co_redir_valid;
-    wire [31:0]      co_redir_pc;
+    wire [31:0]      co_redir_pc, co_redir_next_pc;
     wire [5:0]       co_redir_bsf;
 
     // M8b: combinational early redirect (BRU resolve cycle) -> frontend.
@@ -78,7 +78,7 @@ module student_top (
     wire [31:0] fu_rsp_data;
 
     fetch_unit u_fe (
-        .clock, .reset, .flush(fe_flush),
+        .clock, .reset, .flush(fe_flush), .flush_next_pc(co_redir_next_pc),
         .dec_pc_s(fu_dec_pc), .dec_raw_s(fu_dec_raw), .dec_valid_s(fu_dec_valid),
         .dec_out_valid(dec_ov), .dec_d0(dec_d0), .dec_d1(dec_d1),
         .fe_valid, .fe0, .fe1, .fe_take,
@@ -101,7 +101,8 @@ module student_top (
         .clock, .reset,
         .fe_valid, .fe0, .fe1, .fe_take, .flush_out(flush),
         .flush_dtail_out(co_flush_dtail),
-        .redir_valid(co_redir_valid), .redir_pc(co_redir_pc), .redir_bsf(co_redir_bsf),
+        .redir_valid(co_redir_valid), .redir_pc(co_redir_pc),
+        .redir_next_pc(co_redir_next_pc), .redir_bsf(co_redir_bsf),
         .br_upd_valid, .br_upd_pc, .br_upd_taken, .br_upd_ix, .br_upd_mispred,
         .btb_upd_valid, .btb_upd_pc, .btb_upd_target,
         .ld_valid(co_ld_valid), .ld_req(co_ld_req), .ld_ready(co_ld_ready),

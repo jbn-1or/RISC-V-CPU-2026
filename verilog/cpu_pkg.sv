@@ -15,7 +15,7 @@ package cpu_pkg;
     // ---- 增补参数（references/docs/design.md §3.4）----
     parameter int DECODE_WIDTH = 2;     // 译码/重命名/提交宽度
     parameter int LDQ_DEPTH    = 4;    // 频率优先：8→4 缩减转发矩阵
-    parameter int STQ_DEPTH    = 8;     // 频率优先：16→8 缩减 8x16 转发矩阵
+    parameter int STQ_DEPTH    = 16;     // 频率优先：16→8 缩减 8x16 转发矩阵
     parameter int MUL_LAT      = 4;     // 乘法流水级数
     parameter int DIV_LAT_MAX  = 32;    // 除法迭代上限（radix-2，运行期提前退出）
     parameter int LINE_BYTES   = 32;    // 行大小（16 或 32 B：4/8 × AXI 字）

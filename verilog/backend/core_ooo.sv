@@ -22,6 +22,7 @@ module core_ooo (
     // registered flush_out still drives the ROB/IQ/LSU kill unchanged.
     output logic        redir_valid,
     output logic [31:0] redir_pc,
+    output wire [31:0] redir_next_pc,
     output logic [5:0]  redir_bsf,
 
     // ---- branch resolution feedback (BHT training) ----
@@ -313,6 +314,13 @@ module core_ooo (
     assign redir_valid = b_i && b_mispred;
     assign redir_pc    = b_taken ? b_tgt : (b_insn.pc + 32'd4);
     assign redir_bsf   = b_bsf;
+    // Precompute the block following each redirect alternative before the
+    // data-dependent taken decision. Align(x)+8 == Align(x+8).
+    wire [31:0] b_target_next = (b_insn.op == cpu_pkg::OP_JALR) ?
+        (b_a + (b_insn.imm + 32'd8)) : (b_insn.pc + (b_insn.imm + 32'd8));
+    wire [31:0] b_fallthrough_next = b_insn.pc + 32'd12;
+    assign redir_next_pc = b_taken ? (b_target_next & 32'hfffffff8) :
+                                    (b_fallthrough_next & 32'hfffffff8);
 
     // ================= MUL =================
     wire m_i0 = iss_valid[0] && (port0 == cpu_pkg::IUP_MUL);
