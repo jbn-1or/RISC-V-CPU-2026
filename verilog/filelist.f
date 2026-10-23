@@ -23,8 +23,8 @@ backend/wb_skid.sv
 backend/core_ooo.sv
 
 # memory
-memory/lsu_b.sv
-memory/lsu_a.sv
+memory/load_store_queue.sv
+memory/memory_subsystem.sv
 memory/dcache.sv
 memory/axi_master.sv
 

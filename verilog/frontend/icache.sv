@@ -1,4 +1,4 @@
-// Instruction cache (design.md §5.1): 2 banks (even/odd line words) of
+// Instruction cache: 2 banks (even/odd line words) of
 // IC_LINES*(LINE_BYTES/8) words each, direct-mapped, one outstanding refill.
 // A fetch block is 8 bytes (2 consecutive line words) and is served in one
 // pipelined read. On a miss the cache refills the whole line with

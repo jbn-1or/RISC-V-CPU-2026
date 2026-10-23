@@ -1,7 +1,7 @@
-// Out-of-order core integration (design.md §3/§4/§6). Wires rename/rob/iq/prf
-// with the execution units, the two result buses BA/BB and their fixed-
-// priority arbiters, the flush broadcast, and the M2 blocking LSU.
-// This is the M3 swap target for the discarded core_seq.
+// Two-wide out-of-order backend: rename, ROB, issue, PRF and execution units.
+// BA/BB arbitrate results and qualify writebacks against live ROB destinations.
+// The frontend redirects in the branch-resolution cycle; registered recovery
+// broadcasts reach ROB/IQ/LSQ one cycle later. See docs/architecture.md.
 module core_ooo (
     input  wire        clock,
     input  wire        reset,
@@ -12,11 +12,11 @@ module core_ooo (
     input  cpu_pkg::fe2rn_t fe1,
     output wire [1:0]  fe_take,
 
-    // ---- flush broadcast (to frontend / A-side kill) ----
+    // ---- registered recovery broadcast (ROB/IQ/LSQ/cache waiter kill) ----
     output cpu_pkg::flush_t flush_out,
     output wire [$clog2(cpu_pkg::ROB_DEPTH):0] flush_dtail_out,
 
-    // ---- M8b: combinational early redirect to the frontend ----
+    // ---- combinational early redirect to the frontend ----
     // Asserted in the BRU resolve cycle (one cycle before flush_out.valid),
     // so the fetch unit can restart at the correct target a cycle earlier. The
     // registered flush_out still drives the ROB/IQ/LSU kill unchanged.
@@ -37,7 +37,7 @@ module core_ooo (
     output logic [31:0] btb_upd_pc,
     output logic [31:0] btb_upd_target,
 
-    // ---- memory channels to lsu_a (A side) ----
+    // ---- memory channels to memory_subsystem ----
     output wire        ld_valid,
     output cpu_pkg::mem_req_t ld_req,
     input  wire        ld_ready,
@@ -48,9 +48,9 @@ module core_ooo (
     input  cpu_pkg::mem_resp_t resp,
     input  wire        resp_replay,
 
-    // ---- M9c: D$ tag probe for the same-line guard relaxation ----
+    // ---- D$ set-valid probe for the same-line guard relaxation ----
     output wire [31:0] probe_addr,
-    input  wire        probe_hit,
+    input  wire        probe_set_valid,
 );
     localparam int PB_C = $clog2(cpu_pkg::PRF_NUM);   // physical tag bits
     localparam int RB_C = $clog2(cpu_pkg::ROB_DEPTH); // rob index bits
@@ -309,7 +309,7 @@ module core_ooo (
         end
     end
 
-    // M8b: early redirect presented combinationally in the resolve cycle (the
+    // Early redirect presented combinationally in the resolve cycle (the
     // registered flush_r above broadcasts the kill one cycle later).
     assign redir_valid = b_i && b_mispred;
     assign redir_pc    = b_taken ? b_tgt : (b_insn.pc + 32'd4);
@@ -377,8 +377,8 @@ module core_ooo (
     wire [31:0] div_wb_data;
     div u_div (.clock, .reset,
         .req_valid(d_i), .req_a(d_a), .req_b(d_b),
-        // Fused DIV/REM pair beat (design §6.4.3) is kept in the unit;
-        // wiring `is_fuse` through rename/IQ is deferred (single-beat path used).
+        // Fused DIV/REM pair support is kept in the unit;
+        // the core currently sends each instruction separately (req_fused=0).
         .req_f3a(d_insn.funct3), .req_f3b(3'b0), .req_fused(1'b0),
         .req_tag_a(d_pdst), .req_rob_a(d_rob),
         .req_tag_b('0), .req_rob_b('0),
@@ -399,7 +399,7 @@ module core_ooo (
                       div_skid_in_ready;
 
 
-    // ================= LSU (M3: lsu_b + lsu_a/dcache crossing the top) ======
+    // ================= load/store queue (cache/AXI integration lives in student_top) ======
     wire l_i0 = iss_valid[0] && (port0 == cpu_pkg::IUP_LSU);
     wire l_i1 = iss_valid[1] && (port1 == cpu_pkg::IUP_LSU);
     wire l_i  = l_i0 || l_i1;
@@ -412,7 +412,7 @@ module core_ooo (
     wire [RB_C-1:0] lsu_wb_rob, lsu_ndone_rob;
     wire [31:0] lsu_wb_data;
     wire        lsu_wb_ready = lsu_wb_valid;   // BB priority 0
-    lsu_b u_lsu (.clock, .reset,
+    load_store_queue u_lsu (.clock, .reset,
         .in_valid(l_i),
         .in_op(l_iss.insn.op),
         .in_funct3(l_iss.insn.funct3),
@@ -420,7 +420,7 @@ module core_ooo (
         .in_imm(l_iss.insn.imm),
         .in_store_data(l_data),
         .in_pdst(l_iss.pdst), .in_rob(l_iss.rob),
-        // M8 (§16.4): store data may still be in flight; hand ps2 + readiness
+        // Store data may still be in flight; hand ps2 + readiness
         // to the STQ, which fills the value later from the writeback bus.
         .in_ps2(l_iss.ps2), .in_rs2_ready(l_iss.rs2_ready),
         .wb_a(ba_ok), .wb_b(bb_ok),
@@ -436,12 +436,12 @@ module core_ooo (
         .ld_valid, .ld_req, .ld_ready,
         .st_valid, .st_req, .st_ready,
         .resp_valid, .resp, .resp_replay,
-        .probe_addr(probe_addr), .probe_hit(probe_hit));
+        .probe_addr(probe_addr), .probe_set_valid(probe_set_valid));
     assign lsu_free_ld = lsu_ld_ok;
     assign lsu_free_st = lsu_st_ok;
 
     // ================= result buses BA / BB =================
-    // Fixed priority (design §4.4): BA ALU0 > BRU > DIV; BB LSU > MUL > ALU1.
+    // Fixed priority: BA ALU0 > BRU > DIV; BB LSU > MUL > ALU1.
     assign mul_grant = !lsu_wb_valid && mul_skid_out.valid;
     // alu1_grant / alu0_grant / bru_grant are assigned in their FU sections.
     assign div_grant = !a0_hv && !b_hv && div_skid_out.valid;

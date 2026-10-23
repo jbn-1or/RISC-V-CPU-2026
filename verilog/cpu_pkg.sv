@@ -1,31 +1,31 @@
-// verilog/cpu_pkg.sv —— 跨人接口契约。任何改动必须双人评审（PR）。
-// 文件名必须与 package 名一致，否则 Verilator 报 DECLFILENAME 警告。
-// 详见 references/teamplan.md（§2 接口契约与内部微协议）。
+// Shared configuration, pipeline payloads and address/age predicates.
+// Module responsibilities and timing contracts: docs/architecture.md.
 package cpu_pkg;
 
-    // ---- 参数：报告要求的参数化集中放这里 ----
-    parameter int ISSUE_WIDTH = 2;      // 发射宽度
-    parameter int ROB_DEPTH   = 32;     // S3-4 实测：32→64 回退（qsort -12%）；保持 32
-    parameter int PRF_NUM     = 64;     // S3-4 实测：64→128 回退；保持 64
-    parameter int IQ_DEPTH    = 4;      // 频率优先：16→4 缩短选择锥
-    // M4: 写回同拍唤醒/操作数旁路（WB->IQ 同拍 CAM 命中即选中，操作数从
-    // 写回总线直取）——省掉依赖链的 1 拍唤醒延迟；0 = 关闭（回归基线对照）。
+    // ---- Backend: validated Tier 3 configuration ----
+    // Widths describe this two-wide implementation, not arbitrary-width generators.
+    parameter int ISSUE_WIDTH = 2;
+    parameter int ROB_DEPTH   = 32;
+    parameter int PRF_NUM     = 64;
+    parameter int IQ_DEPTH    = 4;
+    // Wake/select in the writeback cycle; operands bypass directly from BA/BB.
     parameter int WB_BYPASS   = 1;
 
-    // ---- 增补参数（references/docs/design.md §3.4）----
     parameter int DECODE_WIDTH = 2;     // 译码/重命名/提交宽度
-    parameter int LDQ_DEPTH    = 4;    // 频率优先：8→4 缩减转发矩阵
-    parameter int STQ_DEPTH    = 16;     // 频率优先：16→8 缩减 8x16 转发矩阵
+    parameter int LDQ_DEPTH    = 4;
+    parameter int STQ_DEPTH    = 16;
     parameter int MUL_LAT      = 4;     // 乘法流水级数
     parameter int DIV_LAT_MAX  = 32;    // 除法迭代上限（radix-2，运行期提前退出）
+
+    // ---- Memory: direct-mapped I$/D$, 32-byte lines ----
     parameter int LINE_BYTES   = 32;    // 行大小（16 或 32 B：4/8 × AXI 字）
     parameter int IC_LINES     = 128;   // I$ 组内行数（总行 = ×ASSOC）
-    parameter int DC_LINES     = 1024;  // D$ 组内行数（E6：32KB；须为 2 的幂）
+    parameter int DC_LINES     = 1024;  // D$ 32KB；须为 2 的幂
     parameter int ASSOC        = 1;     // 相联度（1=直接映射）
     parameter int MSHR_N       = 2;     // D$ 未命中合并项
     parameter int AXI_MAX_RD   = 8;     // 在飞 AXI 读上限（≤ 从机队列 16 − 裕量）
     parameter int AXI_MAX_WR   = 8;     // 在飞 AXI 写上限
-    // S3-1 实测中性（256→1024 仅 +0.1%），且大表使 ABC 综合显著变慢 → 回退小表以保可迭代。
+    // ---- Branch prediction ----
     parameter int BHT_ENTRIES  = 256;
     parameter int BTB_ENTRIES  = 128;
     parameter int RAS_DEPTH    = 16;
@@ -42,7 +42,7 @@ package cpu_pkg;
     typedef enum logic [1:0] {
         MRF_IC = 2'd0,  // 取指/ICache refill
         MRF_DC = 2'd1,  // DCache refill（字索引走 idx）
-        MRF_LS = 2'd2   // 保留名（当前 M3 设计所有读均经 D$；此值暂无生产者）
+        MRF_LS = 2'd2   // 保留；当前所有数据读（含 uncached）均经 D$
     } mrf_e;
 
     // ---- 指令大类 ----
@@ -54,7 +54,7 @@ package cpu_pkg;
     // ---- 执行单元分类（发射队列按此选择发射端口）----
     typedef enum logic [2:0] { FU_ALU, FU_MUL, FU_DIV, FU_LSU, FU_BR } fu_e;
 
-    // ---- A 的 decoder 产出 == B 的消费格式，字段只增不删 ----
+    // ---- Decoder output, carried through rename and issue ----
     typedef struct packed {
         logic [31:0] pc;         // 本条指令的 pc（auipc/jal/jalr 需要）
         logic [31:0] imm;        // 已经扩展好的立即数
@@ -69,17 +69,11 @@ package cpu_pkg;
         logic        is_branch;  // 控制流指令（预测/冲刷用）：条件分支与 JALR 置 1
         logic        is_ret;     // 返回指令（JALR 且 rs1∈{x1,x5} 且 rd=x0）：RAS 弹栈/RAS 预测
         logic        is_exit;    // 退出写，必须按序提交（译码期恒 0；退出在运行期地址判定）
-        logic        is_fuse;    // DIV/REM 同源融合标记（解码期成对检测，见 design §6.4.3）
+        logic        is_fuse;    // DIV/REM 配对标记；当前后端仍分别执行
         logic [2:0]  funct3;     // 原始 funct3：ALU 子操作 / 分支条件类型 / load-store 宽度与符号
         logic [6:0]  funct7;     // 原始 funct7：区分 add-sub、srl-sra 等（op_e 已区分 M 扩展大类）
         logic        illegal;    // 未实现/保留编码（CSR/FENCE/ECALL/EBREAK 等）置位，仅自检用
     } decoded_t;
-
-    // ---- 内部微协议载荷：valid 由发送方寄存，ready 由接收方生成 ----
-    typedef struct packed {
-        logic     valid;
-        decoded_t insn;
-    } fetch_out_t;               // IF -> ID
 
     // ---- 写回事件：执行单元 -> ROB ----
     typedef struct packed {
@@ -89,7 +83,7 @@ package cpu_pkg;
         logic [31:0] result;
     } writeback_t;
 
-    // ---- 冲刷广播：BRU/解析 -> 全局（每拍至多 1 次，design §4.3）----
+    // ---- Registered recovery broadcast: BRU -> ROB/IQ/LSQ ----
     typedef struct packed {
         logic        valid;   // 本拍发生误预测冲刷
         logic [31:0] pc;      // 重定向 PC（taken→目标，not-taken→pc+4）
@@ -97,7 +91,9 @@ package cpu_pkg;
         logic [5:0]  bsf;     // 该分支之前 FE 已译码的分支计数（模 64），供 FE 截断幼年指令
     } flush_t;
 
-    // ---- 访存请求：B（AGU/LSQ）-> A（Cache/AXI），valid 由 B 寄存、ready 由 A 生成 ----
+    // ---- LSQ -> memory_subsystem: separate load and store valid/ready channels ----
+    // Selection may fall through combinationally. A stalled selection is latched;
+    // speculative loads can be withdrawn on flush. Retired stores are irrevocable.
     typedef struct packed {
         logic        is_store;               // 0=load，1=store
         logic [31:0] addr;                   // 字节地址（自然对齐）；SB/SH 靠 wstrb 掩码
@@ -107,10 +103,10 @@ package cpu_pkg;
         logic [$clog2(ROB_DEPTH)-1:0] rob;   // 来源 ROB 号：响应配对 + flush 后丢弃过期响应
     } mem_req_t;
 
-    // ---- 访存响应：A -> B。miss 由 A 的 MSHR 内部处理，B 不感知 miss/重试：
-    //      resp.valid 只在数据真正就绪时才拉高，B 侧纯 valid/ready 等待。
-    //      响应可能乱序返回，B 用 rob 号与在飞请求配对；flush 后 A 仍会完成已收下的
-    //      请求（已发出的 AXI 不能撤回），B 按 rob 号丢弃过期响应 ----
+    // ---- memory_subsystem -> LSQ: data, store completion or load replay ----
+    // resp_replay is a separate qualifier: retry the SENT load from WAIT.
+    // Responses have no ready input here; LSQ consumes them immediately. D$ and
+    // MSHR kill bits suppress flushed waiters before a ROB number can be reused.
     typedef struct packed {
         logic        valid;
         logic        is_store;               // 与对应请求配对
@@ -118,9 +114,7 @@ package cpu_pkg;
         logic [31:0] rdata;                  // load 数据（store 响应时忽略）
     } mem_resp_t;
 
-    // ==== M2 增补（references/docs/design.md §4.2/§5.1/§6；纯新增，不动既有字段）====
-
-    // FE→rename 2 路流元素（= IFB 表项内容，design §5.1）
+    // ---- Frontend -> rename: two IFB entries, accepted as a prefix ----
     typedef struct packed {
         logic        valid;
         decoded_t    insn;
@@ -129,20 +123,6 @@ package cpu_pkg;
         logic [31:0] pred_target;  // 预测目标（RAS/BTB，无则 0）
         logic [$clog2(BHT_ENTRIES)-1:0] bix;  // gshare BHT 索引（取指时算好，随指令到 BRU 训练；位宽随 BHT_ENTRIES）
     } fe2rn_t;
-
-    // ROB 表项（design §6.2.1，字段一致）
-    typedef struct packed {
-        logic       valid;
-        logic [4:0] rd;
-        logic [$clog2(PRF_NUM)-1:0] pdst;
-        logic [$clog2(PRF_NUM)-1:0] old_pdst;
-        logic       is_load;
-        logic       is_store;
-        logic       is_branch;
-        logic       is_jalr;
-        logic       done;
-        logic       flushed_dep;
-    } rob_entry_t;
 
     // rename 分派载荷（rename→rob/iq，拍内原子）
     typedef struct packed {
@@ -171,7 +151,7 @@ package cpu_pkg;
         logic        pred_taken;
         logic [31:0] pred_target;
         logic [$clog2(BHT_ENTRIES)-1:0] bix;
-        // M8 (§16.4): stores may issue on address (rs1) alone; this tells the
+        // Stores may issue on address (rs1) alone; this tells the
         // LSU whether the rs2 *value* carried alongside is already valid, or
         // must be filled later by writeback-bus CAM on ps2.
         logic        rs2_ready;
@@ -182,7 +162,7 @@ package cpu_pkg;
         IUP_ALU0, IUP_ALU1, IUP_BRU, IUP_MUL, IUP_DIV, IUP_LSU
     } iup_e;
 
-    // 冲刷环距谓词（design §4.3）：rob 号 i 是否严格年轻于冲刷点 frob。
+    // 冲刷环距谓词：rob 号 i 是否严格年轻于冲刷点 frob。
     // dtail = (ROB tail - frob) mod ROB_DEPTH，由 ROB 单点计算后广播，避免
     // ROB/IQ/LSU 各自重复推导而漂移。位宽随 ROB_DEPTH 派生（RB+1 位域）：
     // 0 = 无幼年项；ROB_DEPTH = 满窗（frob 恰为满 ROB 头部，幼年项为其余
@@ -196,8 +176,8 @@ package cpu_pkg;
         flush_younger = (d != {RB{1'b0}}) && ({1'b0, d} < dtail);
     endfunction
 
-    // 非缓存地址判定（design §7.5/§7.6）：addr[31:28] != 0 → 绕过 D$（含退出 MMIO）。
-    // 单点定义，供 dcache（load 侧）与 lsu_a（store 侧）共用，避免两处副本漂移。
+    // 非缓存地址判定：addr[31:28] != 0 → 绕过 D$（含退出 MMIO）。
+    // 单点定义，供 dcache（load 侧）与 memory_subsystem（store 侧）共用，避免两处副本漂移。
     function automatic logic is_uncached(input logic [31:0] addr);
         is_uncached = (addr[31:28] != 4'd0);
     endfunction

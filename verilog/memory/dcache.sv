@@ -1,4 +1,4 @@
-// Data cache (design.md §7.3): direct-mapped, DC_LINES x LINE_BYTES lines,
+// Data cache: direct-mapped, DC_LINES x LINE_BYTES lines,
 // write-through and no-write-allocate, byte-write masks, MSHR_N outstanding
 // line fills with keyword-first completion, and a kill bit that drops a
 // flushed waiter's response. One 1RW SRAM port per line word (LINE_BYTES/4
@@ -8,15 +8,16 @@
 //
 // Response merge: lookup results, MSHR keyword completions and parked word
 // waiters can occur in the same cycle (at most one of each kind, 3 total), so
-// all are pushed into an FD-deep response FIFO that lsu_a drains when its
-// output lane is free. Tokens (rob numbers) identify the waiter.
+// they merge into an FD-deep response FIFO that memory_subsystem drains when its
+// output lane is free. One successful response may bypass an empty FIFO.
+// Tokens (ROB numbers) identify waiters; killed responses are dropped.
 //
 // Same-set rule: two MSHRs may never target the same set (their refill writes
 // would shred each other's banks); a miss with a busy set responds "replay" and
 // the requester retries later. On MSHR allocation the set's valid bit is
 // cleared immediately so no lookup can hit half-refilled banks.
 //
-// Same-line merge (P0-mwaiter): a lookup that misses because its line is being
+// Same-line miss merging: a lookup that misses because its line is being
 // filled (non-bypass MSHR with the same set+tag) no longer replays for the
 // whole fill window:
 //   * word already backfilled -> partial hit, served from the bank (pend_phit;
@@ -33,17 +34,16 @@ module dcache (
     input  wire        clock,
     input  wire        reset,
 
-    // load lookup (from lsu_a); token pairs the response back to the load
+    // load lookup (from memory_subsystem); token pairs the response back to the load
     input  wire        lk_valid,
     input  wire [31:0] lk_addr,
     input  wire [RB-1:0] lk_token,
     output wire        lk_ready,
 
-    // M9c: combinational tag probe used by lsu_b to relax the same-line guard
-    // for loads that would HIT (a hit never allocates, so the stale-fill race
-    // cannot occur). Purely a read of the tag/valid flop arrays.
+    // Set-valid probe used by load_store_queue to relax its same-line guard.
+    // Conservative hit superset; the normal lookup still checks the full tag.
     input  wire [31:0] probe_addr,
-    output wire        probe_hit,
+    output wire        probe_set_valid,
 
     // load response: data ready (hit or keyword) or a retry request
     output wire        rsp_valid,
@@ -61,7 +61,7 @@ module dcache (
     output wire        su_hit,
     output wire        su_stall,     // set has an in-flight fill; store must wait
 
-    // store-completion line invalidate (stale-fill cleanup, see lsu_a)
+    // store-completion line invalidate (stale-fill cleanup, see memory_subsystem)
     input  wire        inv_valid,
     input  wire [31:0] inv_addr,
 
@@ -80,15 +80,15 @@ module dcache (
     input  wire [31:0] rd_rsp_data,
     output wire        rd_rsp_ready,
 );
-    localparam int SETB = $clog2(cpu_pkg::DC_LINES);    // 8
+    localparam int SETB = $clog2(cpu_pkg::DC_LINES);    // set index bits (10 at DC_LINES=1024)
     localparam int OFFB = $clog2(cpu_pkg::LINE_BYTES);  // 4/5
     localparam int NW   = cpu_pkg::LINE_BYTES / 4;      // words per line 4/8
     localparam int WB   = $clog2(NW);                   // word index bits 2/3
-    localparam int TAGB = 32 - SETB - OFFB;             // 20/19
+    localparam int TAGB = 32 - SETB - OFFB;             // address tag bits (17 at 32-byte lines)
     // Cached lines always have addr[31:28] == 0 (is_uncached() is exactly
     // addr[31:28] != 0), so the top four tag bits are constant zero for every
     // valid tag entry. Store/compare only the low CTAGB bits.
-    localparam int CTAGB = TAGB - 4;                    // 16/15
+    localparam int CTAGB = TAGB - 4;                    // stored tag bits (13 in the default configuration)
     localparam int PWB  = $clog2(NW + 1);               // push-counter bits 3/4
     localparam int MN   = cpu_pkg::MSHR_N;
     localparam int RB   = $clog2(cpu_pkg::ROB_DEPTH);
@@ -115,11 +115,10 @@ module dcache (
     logic [cpu_pkg::DC_LINES-1:0] v_q;
     logic [CTAGB-1:0] tag_q [0:cpu_pkg::DC_LINES-1];
 
-    // M9c: combinationally probe whether probe_addr currently hits. The
-    // valid-only form is a safe superset (a false positive just sends the load
-    // into a miss/replay), and removes the wide tag mux and tag compare from
-    // the same-cycle lsu_b guard path.
-    assign probe_hit = !cpu_pkg::is_uncached(probe_addr) &&
+    // Probe set validity, a safe superset of a tag hit. A false positive
+    // only permits a normal cache lookup, which can still miss or replay.
+    // Avoid a wide tag mux on the same-cycle LSQ guard path.
+    assign probe_set_valid = !cpu_pkg::is_uncached(probe_addr) &&
                        v_q[probe_addr[SETB+OFFB-1:OFFB]];
 
     // ---------------- lookup pipeline (1-cycle SRAM read) ----------------

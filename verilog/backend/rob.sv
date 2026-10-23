@@ -1,4 +1,4 @@
-// Reorder buffer (design.md §6.2): 32-entry in-order commit window.
+// Reorder buffer: 32-entry in-order commit window.
 //   * dispatch: rename hands 1..2 entries per cycle, in program order.
 //   * writeback filtering: BA/BB are matched by (rob#, pdst). A writeback that
 //     matches a live entry is delivered (wb_*_ok) to PRF/IQ and marks done;
@@ -193,29 +193,29 @@ module rob (
                 if (dtail != '0) tail_q <= flush_rob + 1'b1;
                 cnt_q  <= cnt_q - killed;
             end else begin
-            if (disp_valid[0]) begin
-                v_q[tail_q]     <= 1'b1; d_q[tail_q]     <= 1'b0;
-                rd_q[tail_q]    <= disp_rd0;
-                pdst_q[tail_q]  <= disp_pdst0;
-                old_q[tail_q]   <= disp_old0;
-                iss_q[tail_q]   <= 1'b0;
-                ld_q[tail_q]    <= disp_load0;
-                st_q[tail_q]    <= disp_store0;
-            end
-            if (disp_valid[1]) begin
-                v_q[tail_q + 1'b1]    <= 1'b1; d_q[tail_q + 1'b1]    <= 1'b0;
-                rd_q[tail_q + 1'b1]   <= disp_rd1;
-                pdst_q[tail_q + 1'b1] <= disp_pdst1;
-                old_q[tail_q + 1'b1]  <= disp_old1;
-                iss_q[tail_q + 1'b1]  <= 1'b0;
-                ld_q[tail_q + 1'b1]   <= disp_load1;
-                st_q[tail_q + 1'b1]   <= disp_store1;
-            end
-            if (c0) begin v_q[head_q] <= 1'b0; d_q[head_q] <= 1'b0; end
-            if (c1) begin v_q[h1]     <= 1'b0; d_q[h1]     <= 1'b0; end
-            head_q <= head_q + {{(RB-2){1'b0}}, ncmt};
-            tail_q <= tail_q + {{(RB-2){1'b0}}, ndisp};
-            cnt_q  <= cnt_q + {{(RB-1){1'b0}}, ndisp} - {{(RB-1){1'b0}}, ncmt};
+                if (disp_valid[0]) begin
+                    v_q[tail_q]     <= 1'b1; d_q[tail_q]     <= 1'b0;
+                    rd_q[tail_q]    <= disp_rd0;
+                    pdst_q[tail_q]  <= disp_pdst0;
+                    old_q[tail_q]   <= disp_old0;
+                    iss_q[tail_q]   <= 1'b0;
+                    ld_q[tail_q]    <= disp_load0;
+                    st_q[tail_q]    <= disp_store0;
+                end
+                if (disp_valid[1]) begin
+                    v_q[tail_q + 1'b1]    <= 1'b1; d_q[tail_q + 1'b1]    <= 1'b0;
+                    rd_q[tail_q + 1'b1]   <= disp_rd1;
+                    pdst_q[tail_q + 1'b1] <= disp_pdst1;
+                    old_q[tail_q + 1'b1]  <= disp_old1;
+                    iss_q[tail_q + 1'b1]  <= 1'b0;
+                    ld_q[tail_q + 1'b1]   <= disp_load1;
+                    st_q[tail_q + 1'b1]   <= disp_store1;
+                end
+                if (c0) begin v_q[head_q] <= 1'b0; d_q[head_q] <= 1'b0; end
+                if (c1) begin v_q[h1]     <= 1'b0; d_q[h1]     <= 1'b0; end
+                head_q <= head_q + {{(RB-2){1'b0}}, ncmt};
+                tail_q <= tail_q + {{(RB-2){1'b0}}, ndisp};
+                cnt_q  <= cnt_q + {{(RB-1){1'b0}}, ndisp} - {{(RB-1){1'b0}}, ncmt};
             end
         end
     end

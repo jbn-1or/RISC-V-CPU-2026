@@ -1,4 +1,4 @@
-// LSU unit test (M3 A3/B3 acceptance): lsu_b + lsu_a (with the D$) + axi_master
+// LSU integration test: load_store_queue + memory_subsystem (with the D$) + axi_master
 // against a sim.cpp-like AXI4-Lite slave (16-deep queues, fixed latency,
 // in-order R, word-aligned enforcement, write-through memory).
 //
@@ -55,10 +55,10 @@ module tb_lsu;
     cpu_pkg::mem_resp_t resp;
 
     cpu_pkg::writeback_t tb_wb0 = '0, tb_wb1 = '0;
-    lsu_b u_lsu (
+    load_store_queue u_lsu (
         .clock, .reset,
         .in_valid, .in_op, .in_funct3, .in_base, .in_imm, .in_store_data, .in_pdst, .in_rob,
-        // directed tests drive ready store data directly (M8 late-fill path idle)
+        // directed tests drive ready store data directly (late-fill path idle)
         .in_ps2(6'd0), .in_rs2_ready(1'b1), .wb_a(tb_wb0), .wb_b(tb_wb1),
         .ld_alloc_ok, .st_alloc_ok,
         .wb_valid, .wb_tag, .wb_rob, .wb_data, .wb_ready(1'b1),
@@ -69,7 +69,7 @@ module tb_lsu;
         .st_valid, .st_req, .st_ready,
         .resp_valid, .resp, .resp_replay);
 
-    // ---------------- A side ----------------
+    // ---------------- cache and AXI integration ----------------
     wire        la_rd_v, la_rd_ready, la_rd_rsp_valid, la_rd_rsp_ready;
     wire [31:0] la_rd_addr, la_rd_rsp_data;
     wire [4:0]  la_rd_idx, la_rd_rsp_idx;
@@ -77,7 +77,7 @@ module tb_lsu;
     wire [31:0] la_wr_addr, la_wr_data;
     wire [3:0]  la_wr_strb, la_wr_tag, la_wr_rsp_tag;
 
-    lsu_a u_lsa (
+    memory_subsystem u_lsa (
         .clock, .reset,
         .flush_valid, .flush_rob, .flush_dtail,
         .ld_valid, .ld_req, .ld_ready,

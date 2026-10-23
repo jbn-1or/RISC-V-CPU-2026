@@ -1,4 +1,4 @@
-// Pipelined 32x32 multiplier (design.md §6.4.2), structural over MUL_LAT.
+// Pipelined 32x32 multiplier, structural over MUL_LAT.
 // Signed Booth-radix-4 core: b (as a two's-complement value) = Σ d_k·2^{2k},
 // k=0..15, digits from bits (2k-1, 2k, 2k+1) on the raw 32-bit b; identity
 // holds exactly for the signed interpretation, so the core computes

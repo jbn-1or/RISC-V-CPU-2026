@@ -1,4 +1,4 @@
-// Unified issue queue (design.md §6.3): 16 entries with CAM wakeup on the two
+// Unified issue queue: IQ_DEPTH entries with CAM wakeup on the two
 // qualified writeback buses, rotating selection of up to 2 ready entries per
 // cycle, flush killing by ROB ring distance, and function-unit availability
 // gating. Entries live in fixed slots; freed slots are reused via a free-slot
@@ -114,43 +114,14 @@ module iq (
         end
     end
 
-    // ---------------- LSU issue gating (M8: store address-only issue) ------------
-    // A memory op reaches the STQ/LDQ only at its own issue. Therefore:
-    //   * A store may issue only when it is the oldest pending store in the IQ
-    //     (an entry leaves the IQ exactly when it issues, so every store still
-    //     resident is unissued). Stores thus issue strictly in program order, so
-    //     STQ allocation order equals program order and STQ FIFO drain stays
-    //     correct. M8 relaxation: a store issues as soon as its *address*
-    //     operand (rs1) is ready; its data (rs2) may still be pending and is
-    //     filled into the STQ later via the writeback-bus CAM (lsu_b). The
-    //     address is fully known the moment the store enters the STQ.
-    //   * A load may issue only while it precedes that oldest pending store (or
-    //     when no store is pending). It may therefore never bypass an older store
-    //     that has not yet reached the STQ.
-    // Ordering proof (rewritten for M8): when a load L issues, every store
-    // program-older than L is also older than the oldest pending store, hence has
-    // already issued and sits in the STQ *with its address known* (the M8 rule
-    // still requires address readiness to issue). lsu_b's overlap detection is a
-    // pure function of the stored addresses (§7.2, program-order key), so L sees
-    // the complete set of older stores and never reads a location an older store
-    // will overwrite. Data readiness changes only *which* source L forwards from:
-    // if the newest older overlapping store's data is still in flight
-    // (data_valid=0), L cannot forward early and blocks under §7.2 rule 2 exactly
-    // as it would for a store that has not completed — correctness is unaffected.
-    // Loads issuing out of order are otherwise harmless: they never write memory,
-    // and a younger store cannot have dirtied the location before L reads it,
-    // because stores drain only after retirement and retirement is in program
-    // order (L retires before any younger store, so it also executes first).
-    // flush: killed entries are excluded from the head search here and are still
-    // gated by kill[i] at issue.
-    // Selection priority: among the ready, eligible LSU ops the oldest is chosen
-    // (lsu_sel), so the in-order oldest keeps issuing first and only steps aside
-    // while it is not operand-ready or its queue has no room. This avoids letting
-    // round-robin hand the single LSU port to a younger op while the older one is
-    // ready, which measurably delayed the critical in-order memory op.
-    // UNOPTFLAT safety: these predicates depend only on registered state, the
-    // writeback bus, rob_head and the LSU readiness inputs, never on the selected
-    // op (§5A-20).
+    // ---------------- memory ordering at issue ----------------
+    // Stores issue in order as soon as rs1 is ready; rs2 may arrive later on
+    // writeback. A load cannot pass the oldest unissued store. Thus every older
+    // store address is already known to the LSQ when a load enters it, and the
+    // forwarding/blocking checks see all potential dependencies.
+    // Younger stores cannot change memory before that load executes, since
+    // stores drain only after in-order retirement. Flush-killed IQ entries are
+    // excluded from both this age search and the issue selectors.
     logic [D-1:0] lsu_v, lsu_st_v, lsu_elig, lsu_sel;
     // Frequency-first: issue selection must not depend on the combinational
     // flush kill mask.  On a flush cycle the whole issue port is suppressed
@@ -187,7 +158,7 @@ module iq (
         f2 = 1'b0; b2 = '0; i2 = '0;
         for (int i = 0; i < D; i = i + 1) begin
             logic rdy;
-            // M8 (§16.4): a store needs only its address operand (rs1) to
+            // A store needs only its address operand (rs1) to
             // issue; its data (rs2) is filled into the STQ later via the
             // writeback-bus CAM. A load still needs both operands ready.
             rdy = (r1_q[i] || ((cpu_pkg::WB_BYPASS != 0) && r1_set[i])) &&
@@ -217,7 +188,7 @@ module iq (
             i = rot_q + n[SB-1:0];
             // WB bypass: an operand wired to this cycle's qualified writeback is
             // usable immediately (the value is taken from the bus in core_ooo).
-            // M8 (§16.4): stores issue on address (rs1) readiness alone.
+            // Stores issue on address (rs1) readiness alone.
             ok = v_q[i] && issue_en &&
                  (r1_q[i] || ((cpu_pkg::WB_BYPASS != 0) && r1_set[i])) &&
                  (st_ent_q[i] || r2_q[i] || ((cpu_pkg::WB_BYPASS != 0) && r2_set[i]));

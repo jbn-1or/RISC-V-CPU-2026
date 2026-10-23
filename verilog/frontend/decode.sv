@@ -1,4 +1,4 @@
-// Single-instruction RV32IM decoder (design.md §8.1/§8.3).
+// Single-instruction RV32IM decoder.
 // Pure combinational; fills cpu_pkg::decoded_t. Illegal/omitted encodings,
 // CSR/FENCE/ECALL/EBREAK map to OP_NOP with illegal=1 (no side effects).
 module decode1 (

@@ -1,4 +1,4 @@
-// Branch predictor unit test (M3 A3-6, size-generic): BHT direction
+// Branch predictor unit test (size-generic): BHT direction
 // training/saturation, BTB hit/tag/eviction/target reconstruction, dual lookup
 // ports, and RAS push/pop/underflow/overflow behavior. All structural sizes are
 // read from cpu_pkg so the test tracks BTB_ENTRIES / RAS_DEPTH knobs.

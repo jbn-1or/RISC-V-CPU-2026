@@ -1,6 +1,6 @@
-// Physical register file (design.md §3.2/§6.1): PRF_NUM×32 flop array, 4R/2W.
+// Physical register file: PRF_NUM×32 flop array, 4R/2W.
 // Reads are combinational; writes are synchronous. p0 (tag 0) is hardwired to
-// zero and is never written (design §9). Reads of p0 therefore return 0.
+// zero and is never written. Reads of p0 therefore return 0.
 //
 // Storage is an unpacked flop array (Yosys maps indexed reads/writes to
 // one-hot muxes; the packed-vector form created a slow barrel-select on the

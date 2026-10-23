@@ -1,4 +1,4 @@
-// Register rename (design.md §6.1): map table + free/busy/pending bitmaps,
+// Register rename: map table + free/busy/pending bitmaps,
 // chained intra-cycle renaming (slot1 sees slot0's mapping), prefix-sliced
 // dispatch backpressure, and same-cycle flush recovery from the ROB snapshot.
 //
@@ -6,7 +6,7 @@
 //   free_q : allocatable tags;  busy_q : allocated but not yet written back;
 //   pend_q : physical destinations of killed instructions, held until their
 //            (now suppressed) writeback actually arrives — this keeps a stale
-//            writeback from matching a re-allocated tag (design §4.3 rule 2).
+//            writeback from matching a re-allocated tag.
 module rename (
     input  wire        clock,
     input  wire        reset,
@@ -184,7 +184,8 @@ module rename (
             free_q <= {{(cpu_pkg::PRF_NUM-32){1'b1}}, 32'b0};   // tags 32..PRF_NUM-1 free
             busy_q <= '0;
             pend_q <= '0;
-        end else begin            if (flush_valid) begin
+        end else begin
+            if (flush_valid) begin
                 for (int r = 0; r < 32; r = r + 1)
                     if (restore_valid[r])
                         map_q[r] <= restore_pdst[r*PB +: PB];

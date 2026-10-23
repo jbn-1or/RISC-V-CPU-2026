@@ -1,4 +1,4 @@
-// Frontend fetch unit (design.md §5.1/§5.2): PC generation, icache request,
+// Frontend fetch unit: PC generation, icache request,
 // instruction fetch buffer (IFB, 8 entries), JAL/RAS-return redirect and flush
 // truncation.
 //
@@ -8,8 +8,8 @@
 //   hit it is decoded (external decode) and pushed into the IFB while the next
 //   (fall-through) block is requested in the same cycle; on a miss the request
 //   stalls until the refill releases busy, then the same pc is re-requested; a
-//   redirect suppresses one request and restarts at the target. A flush
-//   discards the in-flight response and drops IFB entries younger than the
+//   redirect requests the target immediately when the cache can accept it.
+//   A flush discards the in-flight response and drops IFB entries younger than the
 //   flush point. A JAL/return redirect masks the same-block fall-through slot.
 //   in_take is a two-bit prefix: {slot1_taken, slot0_taken}.
 module fetch_unit (
@@ -68,8 +68,8 @@ module fetch_unit (
 
     wire [31:0] pc_q = pc_r;
     wire        issue_ok;
-    wire [31:0] req_pc;   // S3-2: request address (redirect target in a redirect cycle)
-    wire        req_half; // S3-3: half bit of req_pc
+    wire [31:0] req_pc;   // request address (redirect target in a redirect cycle)
+    wire        req_half; // half bit of req_pc
 
     icache u_ic (
         .clock, .reset,
@@ -166,11 +166,11 @@ module fetch_unit (
     wire s_pred_taken  = second_pred_taken;
     wire [31:0] s_pred_target = second_pred_taken ? second_pred_target : 32'b0;
 
-    // S3-2: fetch the redirect target in the same cycle it is detected instead
+    // Fetch the redirect target in the same cycle it is detected instead
     // of suppressing the request for one cycle. `redirect` implies `resp_ok`
     // (hence !flush.valid && !miss_det), so it is mutually exclusive with the
     // flush and miss paths. This removes the per-taken-branch request bubble.
-    // S3-3: likewise fetch the flush target (M8b early fe_flush) in its own
+    // Likewise fetch the flush target (early branch redirect) in its own
     // cycle, removing the per-misprediction request bubble.
     assign req_pc   = flush.valid ? (flush.pc    & 32'hfffffff8) :
                       redirect    ? (red_target  & 32'hfffffff8) : pc_q;
@@ -212,7 +212,7 @@ module fetch_unit (
     assign fe1 = ifb_mem[ifb_head + 3'd1];
 
     wire ifb_ok = (ifb_cnt + {2'b0, n_push}) <= 4'd6;
-    // S3-2/S3-3: neither `redirect` nor `flush` suppresses the request; their
+    // Neither `redirect` nor `flush` suppresses the request; their
     // targets are requested in the same cycle via req_pc. A miss still stalls
     // (its block is re-requested after the refill), and a busy port or a full
     // IFB still suppresses.
@@ -272,7 +272,7 @@ module fetch_unit (
 
             // ---- PC / bsf update (pipelined: one request per cycle) ----
             if (flush.valid) begin
-                // S3-3: if the flush-target request was issued this cycle,
+                // If the flush-target request was issued this cycle,
                 // advance past it; otherwise restart at the target next cycle.
                 if (issue_ok) begin
                     pc_r   <= flush_next_pc;
@@ -287,7 +287,7 @@ module fetch_unit (
                 half_r <= r_half_q;
                 // bsf_r held: the same block is re-fetched
             end else if (redirect) begin
-                // S3-2: the target request was issued this cycle (req_pc), so
+                // The target request was issued this cycle (req_pc), so
                 // advance past it; if the port was busy / IFB full, restart at
                 // the target next cycle instead.
                 if (issue_ok) begin

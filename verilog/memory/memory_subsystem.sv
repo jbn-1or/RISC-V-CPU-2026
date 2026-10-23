@@ -1,17 +1,13 @@
-// LSU A side (design.md §7.3/§7.4): owns the D$ (instantiates dcache), forwards
-// load replay requests, drives store hit-updates + write-through drains into the
-// AXI write path, and merges A-side responses back to lsu_b.
+// Cache/AXI integration: load lookups, atomic store drains and response merge.
 //
-// Load requests are stateless here: ld_req is presented to the D$ lookup port
-// and answered later by the D$ response FIFO (hit / keyword) or a replay event.
-// Store drains run a small FSM per store: cache hit-update first (so any later
-// cache hit is coherent), then wrQ push with a 4-bit identity tag; the B
-// response for that tag becomes a store completion. Because the AXI B channel
-// returns in write order, tags are looked up in a small table.
+// A cached store is accepted only when both the D$ update and AXI write queue
+// can accept it. Uncached stores use only AXI. The cache hit result arrives one
+// cycle later and is recorded with the write tag; a missed store invalidates
+// its set when AXI B returns to prevent a concurrent fill from leaving stale data.
 //
-// Response arbitration: store completions have priority over load responses
-// (load responses can wait in the D$ FIFO, B responses cannot be retracted).
-module lsu_a (
+// Response priority: buffered store completion > current AXI B > D$ load.
+// Store completions cannot be backpressured; load responses wait in the D$ FIFO.
+module memory_subsystem (
     input  wire        clock,
     input  wire        reset,
 
@@ -20,21 +16,21 @@ module lsu_a (
     input  wire [$clog2(cpu_pkg::ROB_DEPTH)-1:0] flush_rob,
     input  wire [$clog2(cpu_pkg::ROB_DEPTH):0] flush_dtail,
 
-    // ---- B side: load replay ----
+    // ---- load queue: lookup/retry ----
     input  wire        ld_valid,
     input  cpu_pkg::mem_req_t ld_req,
     output wire        ld_ready,
 
-    // ---- M9c: D$ tag probe for the same-line guard relaxation ----
+    // ---- D$ set-valid probe for the same-line guard relaxation ----
     input  wire [31:0] probe_addr,
-    output wire        probe_hit,
+    output wire        probe_set_valid,
 
-    // ---- B side: store drain ----
+    // ---- store queue: retired store drain ----
     input  wire        st_valid,
     input  cpu_pkg::mem_req_t st_req,
     output wire        st_ready,
 
-    // ---- responses to B ----
+    // ---- responses to load/store queue ----
     output wire        resp_valid,
     output cpu_pkg::mem_resp_t resp,
     output wire        resp_replay,
@@ -71,9 +67,9 @@ module lsu_a (
         .clock, .reset,
         .lk_valid(ld_valid), .lk_addr(ld_req.addr), .lk_token(ld_req.rob),
         .lk_ready(dc_lk_ready),
-        .probe_addr(probe_addr), .probe_hit(probe_hit),
+        .probe_addr(probe_addr), .probe_set_valid(probe_set_valid),
         .rsp_valid(dc_rsp_valid), .rsp_token(dc_rsp_token), .rsp_data(dc_rsp_data),
-        .rsp_replay(dc_rsp_replay), .rsp_ready(dc_rsp_sel_q),
+        .rsp_replay(dc_rsp_replay), .rsp_ready(dc_response_take),
         .su_valid(su_valid), .su_addr(su_addr), .su_data(su_data), .su_strb(su_strb),
         .su_ready(dc_su_ready), .su_hit(dc_su_hit), .su_stall(dc_su_stall),
         .inv_valid, .inv_addr,
@@ -83,16 +79,17 @@ module lsu_a (
 
     assign ld_ready = dc_lk_ready;
 
-    // ---------------- store drain (S3-5: single-cycle) ----------------
+    // ---------------- store drain (atomic cache update and AXI enqueue) ----------------
     // The D$ hit-update (su) and the AXI write push (wrQ) are independent
-    // resources, so one store completes per cycle when both accept. Locking the
+    // resources, so one store drains per cycle when both accept. Locking the
     // D$ update and the memory write to the same cycle (wr_push_valid gated by
-    // the su side) keeps them atomic. This replaces the old IDLE/SU/PUSH
-    // 3-cycle sequence that capped drain throughput at 1 store/3 cycles.
+    // the su side) keeps them atomic. Completion is reported later, on AXI B.
     logic [3:0]  seq_q;
     logic [RB-1:0] tagrob [0:15];
     logic [31:0] tagaddr [0:15];
     logic        tagmiss [0:15];
+    // Cache hit/miss is available one cycle after drain acceptance. These
+    // registers carry the accepted store identity alongside that cache stage.
     logic        tw_v;
     logic [3:0]  tw_tag;
     logic [31:0] tw_addr;
@@ -140,7 +137,7 @@ module lsu_a (
     wire out_pend = sp_v;
     wire out_wr   = !sp_v && wr_rsp_valid;
     wire out_ld   = !sp_v && !wr_rsp_valid && dc_rsp_valid;
-    wire dc_rsp_sel_q = out_ld;          // D$ FIFO drains only when selected
+    wire dc_response_take = out_ld;          // D$ FIFO drains only when selected
 
     always_comb begin
         resp = '0;

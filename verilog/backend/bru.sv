@@ -1,6 +1,6 @@
-// Branch/JALR resolution unit (design.md §6.4.4).
+// Branch/JALR resolution unit.
 // Computes condition per funct3 and the true target; compares against the
-// predictor's guess (M1: pred_taken=0, pred_target ignored) and the caller
+// predictor's direction/target, and the caller
 // turns a mismatch into a flush_t broadcast.
 module bru (
     input  wire        in_valid,

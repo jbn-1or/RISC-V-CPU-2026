@@ -1,4 +1,4 @@
-// AXI4-Lite master arbitrator (design.md §7.4).
+// AXI4-Lite master arbitrator.
 // Sources (IC$ refill / D$ refill / LSU direct read) are shaped into an ordered
 // read queue; responses return strictly in request order (slave serves the AR
 // queue in order). Write pushes complete strictly in push order (slave B queue).

@@ -1,4 +1,4 @@
-// ALU (design.md §6.4.1). Serves OP_LUI/AUIPC/JAL plus OP_ALU (funct3/funct7
+// ALU. Serves OP_LUI/AUIPC/JAL plus OP_ALU (funct3/funct7
 // routed). B operand is pre-selected by the caller from uses_imm.
 module alu (
     input  wire        in_valid,

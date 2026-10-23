@@ -1,4 +1,4 @@
-// Small writeback skid FIFO (design §4.4): absorbs pipelined FU results
+// Small writeback skid FIFO: absorbs pipelined FU results
 // (MUL/DIV) so a briefly busy result bus never drops a beat.
 module wb_skid #(
     parameter int DEPTH = 4

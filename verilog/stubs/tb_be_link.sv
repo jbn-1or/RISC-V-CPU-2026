@@ -90,7 +90,7 @@ module tb_be_link;
         end
     end
 
-    // ---------------- A-side memory stub (plays lsu_a) ----------------
+    // ---------------- A-side memory stub (plays memory_subsystem) ----------------
     // Loads: accepted immediately, answered after a fixed latency, paired by
     // rob. Stores: accepted when idle, applied to memory, completion
     // (is_store=1) returned after a fixed latency, in order.

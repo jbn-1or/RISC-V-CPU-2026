@@ -1,28 +1,22 @@
-// LSU B side (design.md §7.1/§7.2): AGU, load queue, store queue, load-store
-// forwarding and blocking, replay scheduling, retire-gated store drain.
+// Address generation, load/store queues, forwarding and replay scheduling.
 //
-// Loads: allocated at issue (AGU computes the address). Each cycle the oldest
-// WAIT entry whose forwarding decision says "go" is selected, latched and
-// presented to the A side (lsu_a) as a mem_req_t; the A side answers exactly
-// once per accepted request (data or "replay", the latter returns the entry to
-// WAIT). A load whose byte range is fully covered by the newest older
-// overlapping store completes directly from that store's wdata without any
-// memory access. Partial overlap, or a same-line older store (stale-line
-// allocation guard), blocks until those stores complete.
+// Loads allocate at issue and move WAIT -> SENT on cache acceptance. A replay
+// returns them to WAIT; a successful response writes back on BB in the same
+// cycle. Fully covered store forwards use a writeback register to keep the
+// store-compare tree off the same-cycle wakeup/branch path. Partial overlap
+// blocks the load. A same-line guard prevents stale cache allocations.
 //
-// Stores: allocated at issue with the §8.2 byte-lane mask; the ROB entry is
-// marked done at AGU (early retire, design §6.2.2). A store may only drain to
-// AXI after the ROB commits it (retirement pulse), so a wrong-path store can
-// never reach memory. Drain selection is oldest-first; completions (B
-// responses) pop the oldest drained entry, which frees it.
+// Stores issue in program order once their address is ready; missing data is
+// captured later from qualified writeback buses. The AGU marks the ROB entry
+// done, but only retired stores may drain. Entries remain until AXI B completes.
 //
-// Age compares use ROB ring ages relative to rob_head; all live entries span
-// less than ROB_DEPTH, so unsigned age order equals program order.
-module lsu_b (
+// Unretired ages use ROB distance from head. Retired stores use a separate
+// modular retirement stamp, since they may outlive their original ROB slot.
+module load_store_queue (
     input  wire        clock,
     input  wire        reset,
 
-    // ---- issue (from core, program order) ----
+    // ---- issue (loads may issue out of order; stores in order) ----
     input  wire        in_valid,
     input  wire cpu_pkg::op_e in_op,
     input  wire [2:0]  in_funct3,
@@ -31,11 +25,11 @@ module lsu_b (
     input  wire [31:0] in_store_data,
     input  wire [$clog2(cpu_pkg::PRF_NUM)-1:0] in_pdst,
     input  wire [$clog2(cpu_pkg::ROB_DEPTH)-1:0] in_rob,
-    // M8 (§16.4): store data operand tag + whether its value is valid now.
+    // Store data operand tag + whether its value is valid now.
     // If not valid, the STQ captures it later from the writeback-bus CAM.
     input  wire [$clog2(cpu_pkg::PRF_NUM)-1:0] in_ps2,
     input  wire        in_rs2_ready,
-    // M8: qualified writeback bus (BA/BB) used only to fill pending store data.
+    // Qualified writeback bus (BA/BB) used only to fill pending store data.
     input  cpu_pkg::writeback_t wb_a,
     input  cpu_pkg::writeback_t wb_b,
     output wire        ld_alloc_ok,
@@ -63,7 +57,7 @@ module lsu_b (
     input  wire [$clog2(cpu_pkg::ROB_DEPTH)-1:0] flush_rob,
     input  wire [$clog2(cpu_pkg::ROB_DEPTH):0] flush_dtail,
 
-    // ---- memory channels to the A side ----
+    // ---- memory channels to memory_subsystem ----
     output wire        ld_valid,
     output cpu_pkg::mem_req_t ld_req,
     input  wire        ld_ready,
@@ -71,14 +65,14 @@ module lsu_b (
     output cpu_pkg::mem_req_t st_req,
     input  wire        st_ready,
 
-    // ---- responses from the A side ----
+    // ---- responses from memory_subsystem ----
     input  wire        resp_valid,
     input  cpu_pkg::mem_resp_t resp,
     input  wire        resp_replay,
 
-    // ---- M9c: D$ tag probe for the same-line guard relaxation ----
+    // ---- D$ set-valid probe for the same-line guard relaxation ----
     output wire [31:0] probe_addr,
-    input  wire        probe_hit,
+    input  wire        probe_set_valid,
 );
     localparam int DQ = cpu_pkg::LDQ_DEPTH;   // load queue depth
     localparam int SQ = cpu_pkg::STQ_DEPTH;   // store queue depth
@@ -136,7 +130,10 @@ module lsu_b (
 
     // ---------------- load queue ----------------
     logic [DQ-1:0] l_valid;
-    logic [1:0]  l_st [0:DQ-1];        // 0=WAIT 1=SENT 2=DONE
+    localparam logic [1:0] LOAD_WAIT = 2'd0; // waiting for forwarding/cache
+    localparam logic [1:0] LOAD_SENT = 2'd1; // awaiting cache response/replay
+    localparam logic [1:0] LOAD_DONE = 2'd2; // buffered response, awaiting WB hold
+    logic [1:0] l_state [0:DQ-1];
     logic [31:0] l_addr [0:DQ-1];
     logic [2:0]  l_f3   [0:DQ-1];
     logic [RB-1:0] l_rob  [0:DQ-1];
@@ -145,42 +142,37 @@ module lsu_b (
 
     // ---------------- store queue ----------------
     logic [SQ-1:0] s_valid, s_ret, s_drd;
-    logic [SQ-1:0] s_dvalid;                 // M8: store data value present
+    logic [SQ-1:0] s_dvalid;                 // store data value present
     logic [31:0] s_addr [0:SQ-1];
     logic [31:0] s_data [0:SQ-1];
     logic [3:0]  s_mask [0:SQ-1];
     logic [RB-1:0] s_rob  [0:SQ-1];
-    logic [2:0]  s_f3   [0:SQ-1];          // M8: width/sign for late data fill
-    logic [$clog2(cpu_pkg::PRF_NUM)-1:0] s_ps2 [0:SQ-1];  // M8: data producer tag
+    logic [2:0]  s_f3   [0:SQ-1];          // width/sign for late data fill
+    logic [$clog2(cpu_pkg::PRF_NUM)-1:0] s_ps2 [0:SQ-1];  // data producer tag
 
     // ---------------- writeback hold ----------------
-    logic        wb_hv;
-    logic [PB-1:0] wb_h_tag;
-    logic [RB-1:0] wb_h_rob;
-    logic [31:0] wb_h_data;
+    logic        wb_hold_valid;
+    logic [PB-1:0] wb_hold_tag;
+    logic [RB-1:0] wb_hold_rob;
+    logic [31:0] wb_hold_data;
 
-    // M8a early writeback: a load completing THIS cycle (D$ response or store
-    // forward) is driven combinationally onto the BB result bus, so a
-    // dependent consumer can issue with WB_BYPASS in the same cycle and the 2
-    // cycles of the wb_hv hold stage are removed. wb_hv remains the fallback
-    // for a same-cycle dual completion (only one result can leave per cycle).
-    // Priority on BB: early-LSU > hold-LSU > MUL > ALU1 (see core_ooo).
-    logic        early_v;
-    logic [PB-1:0] early_tag;
-    logic [RB-1:0] early_rob;
-    logic [31:0] early_data;
-    logic        rsp_hit;
-    logic [LB-1:0]  rsp_i;
-    logic        fwd_early;
-    logic        rsp_do_early;
+    // D$ data bypasses the hold register; store forwarding enters wb_hold_valid.
+    // A coincident cache response wins BB and leaves the hold entry pending.
+    // Priority: cache response > held LSU result > MUL > ALU1 (core_ooo).
+    logic        cache_wb_valid;
+    logic [PB-1:0] cache_wb_tag;
+    logic [RB-1:0] cache_wb_rob;
+    logic [31:0] cache_wb_data;
+    logic        load_response_match;
+    logic [LB-1:0]  response_load_slot;
 
-    assign wb_valid = early_v || wb_hv;
-    assign wb_tag   = early_v ? early_tag : wb_h_tag;
-    assign wb_rob   = early_v ? early_rob : wb_h_rob;
-    assign wb_data  = early_v ? early_data : wb_h_data;
+    assign wb_valid = cache_wb_valid || wb_hold_valid;
+    assign wb_tag   = cache_wb_valid ? cache_wb_tag : wb_hold_tag;
+    assign wb_rob   = cache_wb_valid ? cache_wb_rob : wb_hold_rob;
+    assign wb_data  = cache_wb_valid ? cache_wb_data : wb_hold_data;
     // The hold entry leaves the bus only when it is the one being presented;
-    // when the early path wins, wb_hv must be retained (not dropped).
-    wire wb_grant = wb_hv && !early_v && wb_ready;
+    // when the early path wins, wb_hold_valid must be retained (not dropped).
+    wire wb_grant = wb_hold_valid && !cache_wb_valid && wb_ready;
 
     // ---------------- issue / allocation ----------------
     wire is_store = (in_op == cpu_pkg::OP_STORE);
@@ -225,16 +217,9 @@ module lsu_b (
     end
 
     // ---------------- program-order keys ----------------
-    // In-order commit makes every retired store older than every live entry,
-    // but a retired store that is still draining sits BEHIND rob_head, so a
-    // plain head-relative age compares wrong against it (an older store can
-    // look younger). Key: retired entries carry a monotonic retire-sequence
-    // stamp (SEQW-bit domain, gap-free per commit pulse) and live entries get
-    // the live domain with head-relative distance ahead; ascending key =
-    // program order. The old 31-dist_behind scheme wrapped for a store that
-    // stayed undrained >=32 retires behind the head, which made completion /
-    // drain pick the wrong entry and left stale store data visible to
-    // forwarding.
+    // Retired stores are older than all live ROB entries, but may outlive
+    // their original ROB slot. Use modular retirement stamps for them and
+    // head-relative ROB distances for live entries. Bit K selects the domain.
     logic [K:0] s_key [0:SQ-1];
     logic [K:0] l_key [0:DQ-1];
     logic [SEQW-1:0] ret_seq_q;
@@ -251,17 +236,16 @@ module lsu_b (
     // of raw stamps would invert order for two entries straddling that wrap.
     // Retire order is modular-compared instead: "a older than b" iff the
     // forward distance b-a is under half the domain. Sound for any pair of
-    // simultaneously live stamps (STQ depth 8, drains continuously: live stamp
-    // distances are tiny compared to 2048). Retired-vs-live is decided by the
-    // domain bit and never reaches this function.
+    // simultaneously live stamps: at most 2*STQ_DEPTH ticks separate live
+    // stores, below half the SEQW-bit domain. Retired-vs-live uses the domain bit.
     function automatic logic seq_older(input logic [SEQW-1:0] a, input logic [SEQW-1:0] b);
         logic [SEQW-1:0] d;
         d = b - a;
         seq_older = (d != '0) && !d[SEQW-1];
     endfunction
 
-    // wrap-safe "a is newer than b" over the unified 13-bit program-order key
-    // (bit 12 = live domain; live is always younger than retired).
+    // Wrap-safe "a is newer than b". Bit K selects the live ROB domain,
+    // which is always younger than the retired-store domain.
     function automatic logic key_newer(input logic [K:0] a, input logic [K:0] b);
         if (a[K] != b[K])     key_newer = a[K];
         else if (a[K])         key_newer = (a[K-1:0] > b[K-1:0]);   // live: dist ahead
@@ -377,7 +361,7 @@ module lsu_b (
             end
             best = ti[1];
             f_data[i] = ldext(s_data[best], l_f3[i], l_addr[i][1:0]);
-            if (l_valid[i] && l_st[i] == 0) begin
+            if (l_valid[i] && l_state[i] == 0) begin
                 sl_any[i] = |sl_mask;
                 f_fwd[i] = tv[1] && ((s_mask[best] & lm) == lm) && s_dvalid[best];
                 blk_ov[i] = tv[1] && !f_fwd[i];
@@ -386,9 +370,9 @@ module lsu_b (
         end
     end
 
-    // M9c guard relaxation index: the oldest load blocked ONLY by the same-line
-    // guard. Computed in its own block that does NOT read probe_hit, so gs_i
-    // cannot feed back through probe_addr -> probe_hit. That feedback was a
+    // Guard relaxation index: the oldest load blocked ONLY by the same-line
+    // guard. Computed in its own block that does NOT read probe_set_valid, so gs_i
+    // cannot feed back through probe_addr -> probe_set_valid. That feedback was a
     // circular-combinational path (signal gs_i) that made ABC synthesis
     // explode from minutes to >20 min.
     always_comb begin
@@ -396,7 +380,7 @@ module lsu_b (
         logic [K:0] gs_key;
         gs_v_l = 1'b0; gs_i = '0; gs_key = '1;
         for (int i = 0; i < DQ; i = i + 1) begin
-            if (l_valid[i] && (l_st[i] == 2'd0) && sl_any[i] && !blk_ov[i] &&
+            if (l_valid[i] && (l_state[i] == LOAD_WAIT) && sl_any[i] && !blk_ov[i] &&
                 !f_fwd[i] && !ld_kill_mask[i] &&
                 (!gs_v_l || (l_key[i] < gs_key))) begin
                 gs_v_l = 1'b1; gs_i = i[LB-1:0]; gs_key = l_key[i];
@@ -411,7 +395,7 @@ module lsu_b (
     logic [DQ-1:0] f_go_r;
     always_comb begin
         f_go_r = f_go;
-        if (gs_v && probe_hit) f_go_r[gs_i] = 1'b1;
+        if (gs_v && probe_set_valid) f_go_r[gs_i] = 1'b1;
     end
 
     // ---------------- load scheduler ----------------
@@ -437,7 +421,7 @@ module lsu_b (
         logic [LB-1:0] best;
         best_age = '1; best = '0; best_found = 1'b0;
         for (int i = 0; i < DQ; i = i + 1) begin
-            if (l_valid[i] && (l_st[i] == 2'd0) && (f_go_r[i] || f_fwd[i]) &&
+            if (l_valid[i] && (l_state[i] == LOAD_WAIT) && (f_go_r[i] || f_fwd[i]) &&
                 !ld_kill_mask[i]) begin
                 if (!best_found || (l_key[i] < best_age)) begin
                     best_age = l_key[i]; best = i[LB-1:0]; best_found = 1'b1;
@@ -468,7 +452,7 @@ module lsu_b (
         dbest = '1;
         found = 1'b0;
         for (int i = 0; i < DQ; i = i + 1) begin
-            if (l_valid[i] && (l_st[i] == 2'd2)) begin
+            if (l_valid[i] && (l_state[i] == LOAD_DONE)) begin
                 if (!found || (l_key[i] < dbest)) begin
                     dbest = l_key[i];
                     found = 1'b1;
@@ -477,88 +461,68 @@ module lsu_b (
         end
         if (found) begin
             for (int i = 0; i < DQ; i = i + 1)
-                if (l_valid[i] && (l_st[i] == 2'd2) && (l_key[i] == dbest))
+                if (l_valid[i] && (l_state[i] == LOAD_DONE) && (l_key[i] == dbest))
                     done_mask[i] = 1'b1;
         end
     end
     assign dsel = lowest_l(done_mask);
     wire have_done = (done_mask != '0);
-    wire hold_take = have_done && (!wb_hv || wb_grant) && !flush_valid;
+    wire hold_take = have_done && (!wb_hold_valid || wb_grant) && !flush_valid;
 
-    // ---------------- M8a early writeback selection ----------------
-    // A D$ load response is matched to its outstanding (SENT) queue entry by
-    // rob number; the byte extraction is the same ldext used on the normal
-    // path. A store forward completes the latched WAIT candidate directly. Kill
-    // filtering is unchanged (the ROB drops a wrong-path writeback to a
-    // reclaim); the entry itself is released the same cycle, exactly once.
+    // ---------------- cache-response writeback ----------------
+    // Match the outstanding entry by ROB number. ROB qualification rejects
+    // killed results; cache-side kills prevent responses to reused ROB slots.
     always_comb begin
-        rsp_hit = 1'b0;
-        rsp_i   = '0;
+        load_response_match = 1'b0;
+        response_load_slot   = '0;
         if (resp_valid && !resp.is_store && !resp_replay) begin
             for (int i = 0; i < DQ; i = i + 1)
-                if (l_valid[i] && (l_st[i] == 2'd1) && (l_rob[i] == resp.rob)) begin
-                    rsp_hit = 1'b1;
-                    rsp_i   = i[LB-1:0];
+                if (l_valid[i] && (l_state[i] == LOAD_SENT) && (l_rob[i] == resp.rob)) begin
+                    load_response_match = 1'b1;
+                    response_load_slot   = i[LB-1:0];
                 end
         end
     end
     // Store forwarding gets a WB register; D$ responses retain their early
     // path. This cuts STQ comparisons out of same-cycle IQ/BRU wakeup.
-    assign fwd_early = 1'b0;
-    wire fwd_capture = cur_fwd_ok && (!wb_hv || wb_grant) && !flush_valid;
+    wire fwd_capture = cur_fwd_ok && (!wb_hold_valid || wb_grant) && !flush_valid;
     wire wb_hold_kill = flush_valid &&
-        cpu_pkg::flush_younger(wb_h_rob, flush_rob, flush_dtail);
-    always_comb begin
-        early_v    = 1'b0;
-        early_tag  = '0;
-        early_rob  = '0;
-        early_data = 32'b0;
-        if (fwd_early) begin
-            early_v    = 1'b1;
-            early_tag  = l_pdst[cur_i];
-            early_rob  = l_rob[cur_i];
-            early_data = f_data[cur_i];
-        end else if (rsp_hit) begin
-            early_v    = 1'b1;
-            early_tag  = l_pdst[rsp_i];
-            early_rob  = l_rob[rsp_i];
-            early_data = ldext(resp.rdata, l_f3[rsp_i], l_addr[rsp_i][1:0]);
-        end
-    end
-    // the response entry is released early only when it is the one presented
-    // on BB this cycle (a coincident store forward takes priority).
-    assign rsp_do_early = rsp_hit && !fwd_early;
-
+        cpu_pkg::flush_younger(wb_hold_rob, flush_rob, flush_dtail);
+    assign cache_wb_valid = load_response_match;
+    assign cache_wb_tag = load_response_match ? l_pdst[response_load_slot] : '0;
+    assign cache_wb_rob = load_response_match ? l_rob[response_load_slot] : '0;
+    assign cache_wb_data = load_response_match ?
+        ldext(resp.rdata, l_f3[response_load_slot], l_addr[response_load_slot][1:0]) : 32'b0;
 
     always_ff @(posedge clock) begin
         if (reset) begin
             l_valid <= '0;
             s_valid <= '0; s_ret <= '0; s_drd <= '0; s_dvalid <= '0;
-            wb_hv <= 1'b0;
+            wb_hold_valid <= 1'b0;
             sc_v <= 1'b0; st_v <= 1'b0;
             ret_seq_q <= '0;
         end else begin
             // ---- writeback hold ----
             if (fwd_capture) begin
-                wb_hv <= 1'b1;
-                wb_h_tag <= l_pdst[cur_i];
-                wb_h_rob <= l_rob[cur_i];
-                wb_h_data <= f_data[cur_i];
+                wb_hold_valid <= 1'b1;
+                wb_hold_tag <= l_pdst[cur_i];
+                wb_hold_rob <= l_rob[cur_i];
+                wb_hold_data <= f_data[cur_i];
                 l_valid[cur_i] <= 1'b0;
             end else if (hold_take) begin
-                wb_hv     <= 1'b1;
-                wb_h_tag  <= l_pdst[dsel];
-                wb_h_rob  <= l_rob[dsel];
-                wb_h_data <= l_data[dsel];
+                wb_hold_valid     <= 1'b1;
+                wb_hold_tag  <= l_pdst[dsel];
+                wb_hold_rob  <= l_rob[dsel];
+                wb_hold_data <= l_data[dsel];
                 l_valid[dsel] <= 1'b0;
             end else if (wb_grant) begin
-                wb_hv <= 1'b0;
+                wb_hold_valid <= 1'b0;
             end
 
             // ---- issue / allocate ----
             if (in_fire && !is_store && !rd0) begin
                 l_valid[lpos] <= 1'b1;
-                l_st[lpos]    <= 2'd0;
+                l_state[lpos]    <= LOAD_WAIT;
                 l_addr[lpos]  <= in_vaddr;
                 l_f3[lpos]    <= in_funct3;
                 l_rob[lpos]   <= in_rob;
@@ -571,7 +535,7 @@ module lsu_b (
                 s_addr[spos]  <= in_vaddr;
                 s_mask[spos]  <= lanes(in_funct3, in_off);
                 s_rob[spos]   <= in_rob;
-                // M8: data may still be in flight; record the producer tag and
+                // data may still be in flight; record the producer tag and
                 // readiness, and only materialise the value if it is valid now.
                 s_f3[spos]     <= in_funct3;
                 s_ps2[spos]    <= in_ps2;
@@ -580,7 +544,7 @@ module lsu_b (
                                                : 32'b0;
             end
 
-            // ---- M8: late store-data fill from the qualified writeback bus ----
+            // ---- late store-data fill from the qualified writeback bus ----
             // A store issued on address alone may still be waiting for its rs2
             // value; capture it when that producer writes back.
             if (wb_a.valid)
@@ -616,10 +580,10 @@ module lsu_b (
             ret_seq_q <= ret_seq_q + ((n_ret != 2'd0) ? SEQW'(2) : '0);
 
             // ---- drain candidate ----
-            // A candidate is presented the same cycle it is picked; if lsu_a
+            // A candidate is presented the same cycle it is picked; if memory_subsystem
             // accepts right away (st_ready), mark it drained immediately, else
             // latch it until accepted. Recording only via the latched path
-            // would let lsu_a accept the same store twice (double drain).
+            // would let memory_subsystem accept the same store twice (double drain).
             if (!st_v) begin
                 if (drain_ok != '0) begin
                     if (st_ready) begin
@@ -643,21 +607,20 @@ module lsu_b (
                         else begin sc_v <= 1'b1; sc_i <= nsel_i; end
                     end else if (ld_ready) begin
                         // the D$ accepted the combinationally presented request
-                        l_st[nsel_i] <= 2'd1;
+                        l_state[nsel_i] <= LOAD_SENT;
                     end else begin
                         sc_v <= 1'b1;
                         sc_i <= nsel_i;
                     end
                 end
             end else if (cur_fwd) begin
-                // M8a: a forwarding completion leaves on BB this cycle; release
-                // the queue entry now (exactly once) instead of parking it DONE.
+                // Capture the forward in the WB hold and release its queue entry.
                 if (fwd_capture) begin
                     l_valid[sc_i] <= 1'b0;
                     sc_v <= 1'b0;
                 end
             end else if (ld_ready) begin
-                l_st[sc_i] <= 2'd1;
+                l_state[sc_i] <= LOAD_SENT;
                 sc_v <= 1'b0;
             end else if (!f_go[sc_i] && !f_fwd[sc_i]) begin
                 // The candidate's decision is NOT monotone: its forward source
@@ -675,26 +638,26 @@ module lsu_b (
                     if (complete_pick[SB]) s_valid[complete_pick[SB-1:0]] <= 1'b0;
                 end else if (resp_replay) begin
                     for (int i = 0; i < DQ; i = i + 1)
-                        if (l_valid[i] && (l_st[i] == 2'd1) && (l_rob[i] == resp.rob))
-                            l_st[i] <= 2'd0;
-                end else if (rsp_do_early) begin
-                    // M8a: the response is presented on BB this cycle; release
+                        if (l_valid[i] && (l_state[i] == LOAD_SENT) && (l_rob[i] == resp.rob))
+                            l_state[i] <= LOAD_WAIT;
+                end else if (load_response_match) begin
+                    // The response is presented on BB this cycle; release
                     // the outstanding entry now (exactly once).
-                    if (l_valid[rsp_i] && (l_st[rsp_i] == 2'd1) && (l_rob[rsp_i] == resp.rob))
-                        l_valid[rsp_i] <= 1'b0;
+                    if (l_valid[response_load_slot] && (l_state[response_load_slot] == LOAD_SENT) && (l_rob[response_load_slot] == resp.rob))
+                        l_valid[response_load_slot] <= 1'b0;
                 end else begin
                     for (int i = 0; i < DQ; i = i + 1)
-                        if (l_valid[i] && (l_st[i] == 2'd1) && (l_rob[i] == resp.rob)) begin
-                            l_st[i]   <= 2'd2;
+                        if (l_valid[i] && (l_state[i] == LOAD_SENT) && (l_rob[i] == resp.rob)) begin
+                            l_state[i]   <= LOAD_DONE;
                             l_data[i] <= ldext(resp.rdata, l_f3[i], l_addr[i][1:0]);
                         end
                 end
             end
 
-            if (wb_hold_kill) wb_hv <= 1'b0;
+            if (wb_hold_kill) wb_hold_valid <= 1'b0;
 
             // ---- flush kills (loads always; stores only if not retired) ----
-        if (flush_valid) begin
+            if (flush_valid) begin
                 for (int i = 0; i < DQ; i = i + 1)
                     if (l_valid[i] && cpu_pkg::flush_younger(l_rob[i], flush_rob, flush_dtail))
                         l_valid[i] <= 1'b0;

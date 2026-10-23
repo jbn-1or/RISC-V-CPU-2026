@@ -1,47 +1,23 @@
-# 单元测试与替身（stubs）
+# RTL 单元测试
 
-这里放**只用于本地单模块验证**的代码。**这些文件绝对不能写进 `verilog/filelist.f`**：它们只由
-`run_ut.sh` 单独编译运行，不参与 `make build` / `make test` / OJ 提交。
-
-| 文件 | 作用 |
-| --- | --- |
-| `be_sink.sv` | 假后端：A 写前端时用它顶替真正的后端（接收 `cpu_pkg::decoded_t`，按 `LATENCY` 拍后“提交”） |
-| `fe_stub.sv` | 假前端：B 写后端时用它喂固定指令流（按 `COUNT` 条发完为止） |
-| `tb_stub_link.sv` | 把上面两者串起来，验证 valid/ready 握手链路是否成立 |
-| `run_ut.sh` | 一键编译 + 运行：`sh verilog/stubs/run_ut.sh` |
-
-## 运行
+生产 RTL 的编译顺序只维护在 [`../filelist.f`](../filelist.f)。测试顶层位于本目录，`be_sink` 和 `fe_stub` 提供前后端连接桩。
 
 ```sh
-sh verilog/stubs/run_ut.sh                    # 默认 tb_stub_link
-sh verilog/stubs/run_ut.sh tb_my_decoder      # 自己的测试顶层（也要放在本目录）
+python3 tools/run_unit.py tb_lsu --jobs 8
+python3 tools/run_unit.py tb_axi_write
+# 旧入口继续可用，也支持从仓库以外的目录调用：
+sh verilog/stubs/run_ut.sh tb_lsu
 ```
 
-脚本内部用的是课程 AppImage 自带的 Verilator 5.020（`$APPDIR/bin/verilator`），**不需要额外安装工具**，
-产物在 `build/ut_<top>/`（已被 `.gitignore` 忽略）。
+新入口复用课程框架的源文件解析、SRAM 模型和 AppImage 工具选择，启用 Verilator `--timing --assert`。也可以用 `--verilator /path/to/verilator` 指定本机工具。输出位于 `build/ut_<top>/`，每次重建对象目录，避免复用已失效的 AppImage 挂载路径。
 
-预期输出：
+| 测试 | 覆盖内容 |
+| --- | --- |
+| `tb_axi_write` | 256 笔写，AW/W 独立背压、payload 稳定、B tag 顺序及无背压每拍一笔 |
+| `tb_lsu` | LSQ、D$、AXI 集成，转发、重试、退休与冲刷 |
+| `tb_be_link` | 前端输入桩与乱序后端连接 |
+| `tb_stub_link` | decode 与连接桩的接口冒烟测试 |
+| `tb_bp` | BHT、BTB、RAS 和预测索引 |
+| `tb_mul` / `tb_div` | 乘除法执行单元 |
 
-```text
-[be_sink] accept pc=00000000 op=7 rd=0 imm=1
-[be_sink] accept pc=00000004 op=7 rd=1 imm=2
-[be_sink] accept pc=00000008 op=7 rd=2 imm=3
-[be_sink] accept pc=0000000c op=7 rd=3 imm=4
-[tb_stub_link] ok: committed=4 fe_done=1
-- verilog/stubs/tb_stub_link.sv:37: Verilog $finish
-```
-
-## 自己加测试顶层时的注意事项
-
-1. `run_ut.sh` 已把 `scripts/ram/sram_fakeram.sv` 自动加入编译列表
-   （`docs/sram.md` 明确允许框架外仿真这么用；未实例化时只解析不例化，无副作用），
-   需要片上 RAM 的测试顶层直接实例化即可。
-2. 断言写成 `if (!条件) $fatal(1, "消息")`。
-3. 单元测试只保证子模块单独正确，**每天结束前仍要在主干跑一次 `make test`**。
-4. 跨人接口只允许用 `verilog/cpu_pkg.sv` 里的类型；改契约要走 PR 双审。
-5. 手工编译时需要 `--binary --timing -Wno-fatal`，且 **`--Mdir` 目录每次先删掉再重建**：Verilator 生成的
-   makefile 嵌了本次 AppImage 挂载点的绝对路径（每次不同、用后即失效），复用旧目录会报
-   `No rule to make target '/tmp/.mount_cpu202Xxx/verilator/include/verilated.cpp'`。
-   （`run_ut.sh` 已经替你做了 `rm -rf`，这也是框架 `scripts/build.py` 的同样做法。）
-
-分工、对接流程与接口契约说明见 [`../../references/teamplan.md`](../../references/teamplan.md)。
+测试顶层命名为 `tb_*.sv` 后即可由 runner 选择；不要加入生产 `filelist.f`。完整 CPU 正确性、IPC 和综合验证见 [`../../docs/validation.md`](../../docs/validation.md)。

@@ -1,4 +1,4 @@
-// Branch predictor (design.md §5.2): 2-bit BHT for direction, BTB for
+// Branch predictor: 2-bit BHT for direction, BTB for
 // conditional-branch and JALR target guessing, RAS for return-address
 // prediction. BHT counters and BTB entries are trained by the BRU on
 // resolution (one pulse per resolved branch); RAS mis-pops are not repaired

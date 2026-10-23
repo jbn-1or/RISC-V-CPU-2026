@@ -1,8 +1,6 @@
-// student_top: AXI4-Lite master + M3 out-of-order core. Frontend (fetch_unit
-// with icache/BP + decode) and the A-side memory subsystem (lsu_a with the
-// dcache inside) live here; the backend (core_ooo with lsu_b) owns LDQ/STQ.
-// No functional logic: pure interconnect plus the read-push arbitration
-// (D$ refills/bypass reads > I$ refills) and read-response routing by source.
+// CPU integration: frontend, out-of-order backend, cache subsystem and AXI.
+// core_ooo owns the load/store queue; memory_subsystem owns the D$.
+// Production source order is maintained in verilog/filelist.f.
 module student_top (
     input  wire        clock,
     input  wire        reset,
@@ -26,7 +24,7 @@ module student_top (
     input  wire        wready,
 
     // B-channel response: required by the AXI4-Lite interface template; write
-    // errors are intentionally ignored (design §7.6), so it is not consumed.
+    // errors are intentionally ignored, so it is not consumed.
     /* verilator lint_off UNUSEDSIGNAL */
     input  wire [1:0]  bresp,
     /* verilator lint_on UNUSEDSIGNAL */
@@ -53,7 +51,7 @@ module student_top (
     wire [31:0]      co_redir_pc, co_redir_next_pc;
     wire [5:0]       co_redir_bsf;
 
-    // M8b: combinational early redirect (BRU resolve cycle) -> frontend.
+    // Combinational early redirect (BRU resolve cycle) -> frontend.
     // The frontend's flush is advanced one cycle (the backend still receives
     // the registered `flush`), so the PC restarts at the correct target one
     // cycle earlier while the ROB/IQ/LSU kill protocol is unchanged.
@@ -89,7 +87,7 @@ module student_top (
         .rd_rsp_valid(fu_rsp_valid), .rd_rsp_idx(fu_rsp_idx),
         .rd_rsp_data(fu_rsp_data), .rd_rsp_ready(fu_rsp_ready));
 
-    // ---------------- core (B side) ----------------
+    // ---------------- out-of-order backend ----------------
     wire             co_ld_valid, co_ld_ready;
     wire             co_st_valid, co_st_ready;
     wire             co_resp_valid, co_resp_replay;
@@ -108,9 +106,9 @@ module student_top (
         .ld_valid(co_ld_valid), .ld_req(co_ld_req), .ld_ready(co_ld_ready),
         .st_valid(co_st_valid), .st_req(co_st_req), .st_ready(co_st_ready),
         .resp_valid(co_resp_valid), .resp(co_resp), .resp_replay(co_resp_replay),
-        .probe_addr(dc_probe_addr), .probe_hit(dc_probe_hit));
+        .probe_addr(dc_probe_addr), .probe_set_valid(dc_probe_hit));
 
-    // ---------------- A-side memory subsystem: lsu_a + dcache ----------------
+    // ---------------- cache and store-drain integration ----------------
     wire        la_rd_v, la_rd_ready, la_rd_rsp_valid, la_rd_rsp_ready;
     wire [31:0] la_rd_addr, la_rd_rsp_data;
     wire [4:0]  la_rd_idx, la_rd_rsp_idx;
@@ -118,15 +116,15 @@ module student_top (
     wire [31:0] la_wr_addr, la_wr_data;
     wire [3:0]  la_wr_strb, la_wr_tag, la_wr_rsp_tag;
 
-    // M9c: D$ tag probe (lsu_b -> lsu_a/dcache) for same-line guard relaxation
+    // D$ set-valid probe (load_store_queue -> memory_subsystem/dcache) for same-line guard relaxation
     wire [31:0] dc_probe_addr;
     wire        dc_probe_hit;
 
-    lsu_a u_lsa (
+    memory_subsystem u_lsa (
         .clock, .reset,
         .flush_valid(flush.valid), .flush_rob(flush.rob), .flush_dtail(co_flush_dtail),
         .ld_valid(co_ld_valid), .ld_req(co_ld_req), .ld_ready(co_ld_ready),
-        .probe_addr(dc_probe_addr), .probe_hit(dc_probe_hit),
+        .probe_addr(dc_probe_addr), .probe_set_valid(dc_probe_hit),
         .st_valid(co_st_valid), .st_req(co_st_req), .st_ready(co_st_ready),
         .resp_valid(co_resp_valid), .resp(co_resp), .resp_replay(co_resp_replay),
         .rd_push_valid(la_rd_v), .rd_push_addr(la_rd_addr), .rd_push_idx(la_rd_idx),

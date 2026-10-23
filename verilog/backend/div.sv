@@ -1,4 +1,4 @@
-// Iterative divider (design.md §6.4.3): top-aligned restoring division with
+// Iterative divider: top-aligned restoring division with
 // early exit from leading zeros; spec-defined div/rem boundary values.
 // Optional DIV/REM same-source fusion emits both results (two wb beats).
 module div (
