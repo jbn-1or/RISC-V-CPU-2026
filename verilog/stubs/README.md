@@ -14,6 +14,7 @@ sh verilog/stubs/run_ut.sh tb_lsu
 | 测试 | 覆盖内容 |
 | --- | --- |
 | `tb_axi_write` | 256 笔写，AW/W 独立背压、payload 稳定、B tag 顺序及无背压每拍一笔 |
+| `tb_dcache_recovery` | flush 与关键字返回同拍、消费端背压、ROB 号复用、保留较老 load |
 | `tb_lsu` | LSQ、D$、AXI 集成，转发、重试、退休与冲刷 |
 | `tb_be_link` | 前端输入桩与乱序后端连接 |
 | `tb_stub_link` | decode 与连接桩的接口冒烟测试 |

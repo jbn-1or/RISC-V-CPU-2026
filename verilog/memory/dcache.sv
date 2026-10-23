@@ -189,8 +189,10 @@ module dcache (
     wire fifo_rsp = (f_lvl != '0) && !f_skip;
     wire fast_rsp, fast_deq;
     assign rsp_valid = fifo_rsp || fast_rsp;
-    assign rsp_token = fast_rsp ? (ev0 ? ev0_tok : (ev1 ? ev1_tok : ev2_tok)) : f_tok[f_head];
-    assign rsp_data = fast_rsp ? (ev0 ? ev0_dat : (ev1 ? ev1_dat : ev2_dat)) : f_dat[f_head];
+    // Select payload before the late hit/replay decision; only rsp_valid is
+    // qualified by fast_rsp. Inactive payload values are not consumed.
+    assign rsp_token = (f_lvl == 0) ? (ev0 ? ev0_tok : (ev1 ? ev1_tok : ev2_tok)) : f_tok[f_head];
+    assign rsp_data = (f_lvl == 0) ? (ev0 ? ev0_dat : (ev1 ? ev1_dat : ev2_dat)) : f_dat[f_head];
     assign rsp_replay = fast_rsp ? 1'b0 : f_rep[f_head];
     wire rsp_deq = fifo_rsp && rsp_ready;
 
@@ -620,19 +622,25 @@ module dcache (
                 f_tok[f_pos0] <= ev0_tok;
                 f_dat[f_pos0] <= ev0_dat;
                 f_rep[f_pos0] <= 1'b0;
-                f_kill[f_pos0] <= 1'b0;
+                // The flush scan only sees entries already in the FIFO.
+                f_kill[f_pos0] <= flush_valid &&
+                    cpu_pkg::flush_younger(ev0_tok, flush_rob, flush_dtail);
             end
             if (enq1) begin
                 f_tok[f_pos1] <= ev1_tok;
                 f_dat[f_pos1] <= ev1_dat;
                 f_rep[f_pos1] <= 1'b0;
-                f_kill[f_pos1] <= 1'b0;
+                // The flush scan only sees entries already in the FIFO.
+                f_kill[f_pos1] <= flush_valid &&
+                    cpu_pkg::flush_younger(ev1_tok, flush_rob, flush_dtail);
             end
             if (enq2) begin
                 f_tok[f_pos2] <= ev2_tok;
                 f_dat[f_pos2] <= ev2_dat;
                 f_rep[f_pos2] <= ev2_rep;
-                f_kill[f_pos2] <= 1'b0;
+                // The flush scan only sees entries already in the FIFO.
+                f_kill[f_pos2] <= flush_valid &&
+                    cpu_pkg::flush_younger(ev2_tok, flush_rob, flush_dtail);
             end
             if (enq0 || enq1 || enq2)
                 f_tail <= f_tail + {2'b0, enq0} + {2'b0, enq1} + {2'b0, enq2};

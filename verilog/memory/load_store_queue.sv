@@ -475,24 +475,24 @@ module load_store_queue (
     always_comb begin
         load_response_match = 1'b0;
         response_load_slot   = '0;
-        if (resp_valid && !resp.is_store && !resp_replay) begin
-            for (int i = 0; i < DQ; i = i + 1)
-                if (l_valid[i] && (l_state[i] == LOAD_SENT) && (l_rob[i] == resp.rob)) begin
-                    load_response_match = 1'b1;
-                    response_load_slot   = i[LB-1:0];
-                end
-        end
+        // Select payload from the ROB token independently of response validity.
+        // The late cache hit/replay decision only qualifies cache_wb_valid.
+        for (int i = 0; i < DQ; i = i + 1)
+            if (l_valid[i] && (l_state[i] == LOAD_SENT) && (l_rob[i] == resp.rob)) begin
+                load_response_match = 1'b1;
+                response_load_slot = i[LB-1:0];
+            end
     end
     // Store forwarding gets a WB register; D$ responses retain their early
     // path. This cuts STQ comparisons out of same-cycle IQ/BRU wakeup.
     wire fwd_capture = cur_fwd_ok && (!wb_hold_valid || wb_grant) && !flush_valid;
     wire wb_hold_kill = flush_valid &&
         cpu_pkg::flush_younger(wb_hold_rob, flush_rob, flush_dtail);
-    assign cache_wb_valid = load_response_match;
-    assign cache_wb_tag = load_response_match ? l_pdst[response_load_slot] : '0;
-    assign cache_wb_rob = load_response_match ? l_rob[response_load_slot] : '0;
-    assign cache_wb_data = load_response_match ?
-        ldext(resp.rdata, l_f3[response_load_slot], l_addr[response_load_slot][1:0]) : 32'b0;
+    assign cache_wb_valid = resp_valid && !resp.is_store && !resp_replay && load_response_match;
+    assign cache_wb_tag = l_pdst[response_load_slot];
+    assign cache_wb_rob = l_rob[response_load_slot];
+    assign cache_wb_data =
+        ldext(resp.rdata, l_f3[response_load_slot], l_addr[response_load_slot][1:0]);
 
     always_ff @(posedge clock) begin
         if (reset) begin

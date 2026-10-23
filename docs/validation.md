@@ -12,6 +12,7 @@ make test SIM=build/check/sim MAX_CYCLES=20000000 LATENCY=10 > build/check_test.
 make perf SIM=build/check/sim MAX_CYCLES=20000000 LATENCY=10 > build/check_perf.log 2>&1
 python3 tools/run_latency.py --sim build/check/sim --log build/check_latency.log
 python3 tools/run_unit.py tb_lsu --jobs 8
+python3 tools/run_unit.py tb_dcache_recovery --jobs 8
 python3 tools/run_unit.py tb_axi_write --jobs 8
 make synth MODE=opt SYNTH_OUT=build/synth_check
 python3 tools/check_tier3.py --synth build/synth_check/opt \
@@ -26,6 +27,7 @@ python3 tools/check_tier3.py --synth build/synth_check/opt \
 | `make perf` | median、multiply、qsort、rsort、towers、vvadd 六项，LAT=10 |
 | `run_latency.py` | magic、queens、tak、qsort ×LAT=1/50，共 8 项 |
 | `tb_lsu` | load/store queue、D$、AXI 集成和访存定向检查 |
+| `tb_dcache_recovery` | 返回与 flush 同拍时，背压跨越恢复后不得向复用的 ROB 号返回旧数据；较老 load 仍须完成 |
 | `tb_axi_write` | 256 笔写、AW/W 独立停顿、payload 稳定、B tag 顺序、无背压每拍一笔 |
 | `make synth` | 默认 `opt`，保留资源分享；检查时序与面积 |
 | `check_tier3.py` | 三项门槛、报告输入 SHA256、D$ 宏数量/地址驱动及综合错误检查 |
@@ -45,7 +47,38 @@ python3 tools/check_tier3.py --synth build/synth_check/opt \
 
 `check_tier3.py` 针对当前 32 KiB D$ 配置检查 32 个宏；若正式改变容量，需要同时更新结构预期及重新验证指标。
 
-## 验证记录
+## 当前验证结果（频率裕量优化）
+
+2026-10-23，以 `8f2de41` 为基线，保持队列参数、双发射/双提交、缓存容量和全部流水线延迟。使用默认 `MODE=opt`、资源分享和 `CLOCK_PERIOD_NS=2.0` 重新综合。
+
+| 指标 | 优化前 | 当前版本 | 目标 |
+| --- | ---: | ---: | --- |
+| 面积 / µm² | 28,778.756 | **28,659.579** | <36,000 |
+| 综合频率 / MHz | 303.858 | **333.225** | 本轮约 330；Tier 3 >300 |
+| 最小周期 / ns | 3.291015625 | **3.0009765625** | <3.333333333 |
+| IPC 几何平均 | 1.102294 | **1.102294** | ≥1.0985 |
+| 正确性 / LAT=1/50 | 19/19、8/8 | **19/19、8/8** | 全部通过 |
+
+频率提高约 9.66%，相对 300 MHz 门槛的余量约 11.07%。六项性能基准的指令数和周期数与 `8f2de41` 完全一致；完整精度 IPC 为 `1.1022941378197337`。
+
+实现集中在两处：响应 payload 的选择/字节提取提前完成，晚到的 hit/replay 只限定有效性；写回调度资格在最终 BB 选择前完成，LSU 直接使用其在飞队列身份。PRF 写入、ROB 完成和回收保留原有完整检查，仿真断言持续验证 LSU 身份前提。
+
+同时修复 FIFO 入队与 flush 同拍的 kill 标记遗漏。新增定向测试在原版本复现了 `token=4` 的旧数据返回到复用 ROB 号的问题；本版验证被杀死响应丢弃、较老 load 保留。LSU、后端连接和新恢复测试均通过。
+
+结构审计通过：32 个 D$ SRAM 宏、10 位地址完整驱动、无 ERROR/latch/端口 resize，报告输入 SHA256 匹配当前 RTL。
+
+| 本轮产物 | 路径 |
+| --- | --- |
+| 仿真器 / 构建日志 | `build/sim_freq330_verified/sim`、`build/build_freq330_verified.log` |
+| 正确性 / IPC | `build/test_freq330_verified.log`、`build/perf_freq330_verified.log` |
+| 延迟矩阵 | `build/latency_freq330_verified.log`、`build/latency_freq330_verified_summary.log` |
+| LSU / 恢复边界 | `build/lsu_freq330_verified.log`、`build/recovery_freq330_verified.log` |
+| 后端连接 | `build/be_freq330_final.log` |
+| 综合 | `build/synth_freq330_verified/opt/{report.json,report.txt,timing.rpt,design.json,mapped.v}` |
+| 审计 / 汇总 | `build/audit_freq330_verified.json`、`build/verification_freq330.json` |
+| 冻结 RTL | `build/rtl_freq330_verified/` |
+
+## 历史基线（可读性重构）
 
 重构前基线为 `9fcb1d7`（`tier3-throughput`）：28,456.713 µm²、310.491 MHz、IPC 1.102294；正确性 19/19、延迟回归 8/8、AXI 定向检查通过。
 

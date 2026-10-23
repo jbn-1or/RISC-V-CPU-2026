@@ -146,7 +146,8 @@ module memory_subsystem (
         if (out_pend)      resp.rob   = sp_rob;
         else if (out_wr)   resp.rob   = wr_rob;
         else               resp.rob   = dc_rsp_token;
-        resp.rdata = out_ld ? dc_rsp_data : 32'b0;
+        // The data payload is consumed only for a valid load response.
+        resp.rdata = dc_rsp_data;
     end
     assign resp_valid  = resp.valid;
     assign resp_replay = out_ld && dc_rsp_replay;

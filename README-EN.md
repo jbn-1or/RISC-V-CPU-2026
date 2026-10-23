@@ -21,7 +21,7 @@ Start with the [architecture guide, in Chinese](docs/architecture.md), then read
 
 The ordinary ALU path has five broad phases: fetch, decode into the IFB, rename/dispatch, issue/execute/writeback, and commit. Queue waits, multiplication, division and cache misses have different latencies; this is not a fixed five-cycle machine.
 
-The Tier 3 requirements are **area <36,000 µm², frequency >300 MHz, and geometric-mean IPC ≥1.0985**. The refactored version achieves **28,778.756 µm², 303.858 MHz and IPC 1.102294** under the course synthesis flow. Correctness passes 19/19, the latency matrix passes 8/8, and all six benchmark instruction/cycle counts match the baseline. See the [validation record](docs/validation.md) for details.
+The Tier 3 requirements are **area <36,000 µm², frequency >300 MHz, and geometric-mean IPC ≥1.0985**. The current implementation achieves **28,659.579 µm², 333.225 MHz and IPC 1.102294** under the course synthesis flow, with 11.1% frequency margin over 300 MHz. Correctness passes 19/19, the latency matrix passes 8/8, and all six benchmark instruction/cycle counts match the baseline. See the [validation record](docs/validation.md) for details.
 
 ## Build and check
 

@@ -58,18 +58,23 @@ BRU 在解析拍通过 `redir_*` 让前端开始恢复取指；`flush_r` 在下�
 | `RB` / `PB` | ROB 索引位数 / 物理寄存器号位数 |
 | `DQ` / `SQ`、`LB` / `SB` | load/store 队列深度及其槽位索引位数 |
 | `pdst` / `old_pdst`、`ps1` / `ps2` | 新/旧目的物理寄存器及两个源物理寄存器 |
-| `ba` / `bb`、`ba_ok` / `bb_ok` | 原始写回结果及通过 ROB 身份校验的结果 |
+| `ba` / `bb`、`ba_ok` / `bb_ok` | 原始写回结果及用于架构状态更新的完整 ROB 校验结果 |
+| `ba_sched` / `bb_sched`、`bb_other` | 调度/操作数旁路使用的写回流，以及独立于 LSU 选择的寄存生产者候选 |
 
 `fe_take` 和分派有效位都是双路前缀：slot1 有效意味着 slot0 有效。rename 同拍分配目的寄存器和 ROB 号，同时向 ROB/IQ 原子分派。
 
 ## 后端的几个约束
 
-- ROB 对写回同时检查 ROB 号和物理目的寄存器，防止错误路径结果污染已复用的槽位。IQ/PRF 只使用校验后的写回。
+- ROB 对写回同时检查 ROB 号和物理目的寄存器，防止错误路径结果污染已复用的槽位。PRF、rename 和 STQ 的 late-data capture 使用完整校验后的写回。
 - flush 仅杀死分支之后的年轻指令，环形年龄统一调用 `flush_younger`；`dtail` 由 ROB 计算后广播。
 - 被杀死且尚未返回的长延迟生产者，其物理寄存器进入 pending 回收状态，等待旧结果返回后再释放。
 - IQ 轮转选择最多两条指令，并检查功能单元占用；LSU 候选在符合顺序条件时优先选年龄最老者。
 - 同拍发射释放的 IQ 槽位可以接收新分派。旧指令的 wakeup 不能覆盖新表项的 ready 位。
 - 写回优先级为 `BA: ALU0 > BRU > DIV`、`BB: LSU > MUL > ALU1`；需保持来源与背压规则配套。
+
+调度与操作数旁路使用 `ba_sched/bb_sched`。ALU/BRU/DIV/MUL 等寄存生产者提前查询 ROB；BB 的候选 `bb_other` 独立于晚到的 LSU 有效信号，避免先选择 BB 再串行查表。LSU 的 load 在 LDQ 或 writeback hold 中保留身份直到结果被接受，因此其有效结果可直接参与调度。仿真断言检查：恢复拍之外，每个 LSU 写回都必须同时通过原 ROB 的完整检查。
+
+恢复拍禁止分派和发射；被杀死生产者的依赖者也属于被杀死集合。调度资格省略同拍 kill 比较，PRF 写入、ROB 完成和回收仍保留完整过滤。此调整没有新增寄存器级或改变功能单元延迟。
 
 ## 访存分层
 
@@ -80,7 +85,7 @@ BRU 在解析拍通过 `redir_*` 让前端开始恢复取指；`flush_r` 在下�
 1. 在 IQ 中，load 不能越过尚未发射的更老 store。进入 LDQ 时，所有更老 store 的地址都已经在 STQ 中。
 2. `LOAD_WAIT` 搜索最新的更老重叠 store。完全覆盖且数据已就绪时转发；部分覆盖或数据未就绪时阻塞。
 3. 可访问 cache 的候选在 `ld_valid && ld_ready` 时变为 `LOAD_SENT`。MSHR/集合冲突等 replay 将它退回 `LOAD_WAIT`。
-4. cache 成功响应以 ROB 号匹配在飞 load，同拍进入 BB；store forwarding 则先进入 `wb_hold_*`，下一拍参与写回。`LOAD_DONE` 保留响应缓冲路径。
+4. cache 成功响应以 ROB 号匹配在飞 load，同拍进入 BB；payload 匹配、字节提取提前计算，最后才用响应有效/重试信号限定写回；store forwarding 则先进入 `wb_hold_*`，下一拍参与写回。`LOAD_DONE` 保留响应缓冲路径。
 5. cache 返回与已保存结果同时出现时，cache 返回优先，hold 继续保存。flush 同时清除年轻的队列表项和待写回转发结果。
 
 同 cache line 的更老 store 还参与 stale-fill 防护。`probe_set_valid` 仅检查集合 valid，是 tag 命中的安全上界；正常 lookup 仍负责完整 tag 检查、MSHR 冲突和 replay。不要将它误读为精确 tag 命中。
@@ -97,7 +102,7 @@ store 按程序顺序发射，但只需要地址操作数就绪。数据可以�
 
 D$ 为 1024 行 ×32 B，8 个 32-bit 单端口 word bank，经 fakeram 映射为 32 个 `1024x8` SRAM 宏。端口优先级为 `refill write > load lookup > store update`。tag 读在现有 op/pend 阶段中分成 4 个 bank，缩短大容量 tag mux 路径；live valid 和同拍 fill 旁路仍须参与命中判定。
 
-两个 MSHR 不允许填同一个 set。同一行的字已经返回时可 partial hit，否则可在对应字挂 waiter；只有 waiter 冲突等情况才 replay。trigger、parked waiter、lookup 响应汇入 FIFO；空 FIFO 且只有一项成功响应时可以直通。flush 必须覆盖 lookup 流水线、MSHR waiter 及 FIFO，防止旧响应命中复用后的 ROB 号。
+两个 MSHR 不允许填同一个 set。同一行的字已经返回时可 partial hit，否则可在对应字挂 waiter；只有 waiter 冲突等情况才 replay。trigger、parked waiter、lookup 响应汇入 FIFO；空 FIFO 且只有一项成功响应时可以直通。flush 必须覆盖 lookup 流水线、MSHR waiter 及 FIFO，防止旧响应命中复用后的 ROB 号。FIFO 在入队时也登记同拍 flush 的 kill，补足只扫描已有表项的边界情况。响应 payload 按寄存的 FIFO 空/非空状态选择，命中/重试结果仅决定有效性，避免将晚到的有效信号串进数据选择。
 
 `is_uncached(addr)` 统一定义为 `addr[31:28] != 0`，包括退出 MMIO。非缓存访问仍经过数据访存通路，但不建立有效 cache 行。store 的 AXI 地址按 word 对齐，字节选择由 `wstrb` 表示。
 

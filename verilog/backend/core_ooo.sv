@@ -70,7 +70,19 @@ module core_ooo (
     wire [32*PB_C-1:0] restore_pdst;
     wire [RB_C:0] rob_flush_dtail;
 
-    cpu_pkg::writeback_t ba, bb, ba_ok, bb_ok;
+    cpu_pkg::writeback_t ba, bb, ba_ok, bb_ok, ba_sched, bb_sched, bb_other;
+    wire sched_a_match, sched_b_match;
+    // LSU results retain their live LDQ/hold identity until accepted. Other
+    // producers use an early ROB check independent of the LSU bus selection.
+    // PRF writes, rename and late store-data capture still use ba_ok/bb_ok.
+    always_comb begin
+        bb_other = mul_skid_out.valid ? mul_skid_out : a1_h;
+        bb_other.valid = mul_skid_out.valid || a1_hv;
+        ba_sched = ba;
+        ba_sched.valid = ba.valid && sched_a_match;
+        bb_sched = bb;
+        bb_sched.valid = lsu_wb_valid || (bb_other.valid && sched_b_match);
+    end
     wire        rec_a_valid, rec_b_valid;
     wire [PB_C-1:0] rec_a_tag, rec_b_tag;
     wire [cpu_pkg::PRF_NUM-1:0] wb_clr_mask, reclaim_mask;
@@ -143,6 +155,7 @@ module core_ooo (
         .mk1_valid(iq_iss1_v), .mk1_rob(iq_iss1_rob),
         .alloc_ptr(rob_alloc_ptr), .head_ptr(rob_head), .alloc_space(rob_space),
         .wb_a(ba), .wb_b(bb), .wb_a_ok(ba_ok), .wb_b_ok(bb_ok),
+        .sched_b_candidate(bb_other), .sched_a_match, .sched_b_match,
         .rec_a_valid(rec_a_valid), .rec_a_tag(rec_a_tag),
         .rec_b_valid(rec_b_valid), .rec_b_tag(rec_b_tag),
         .ndone_valid(lsu_ndone_valid), .ndone_rob(lsu_ndone_rob),
@@ -157,7 +170,7 @@ module core_ooo (
         .clock, .reset,
         .disp_valid(iq_valid), .d0(iq_d0), .d1(iq_d1), .space(iq_space),
         .rob_head(rob_head),
-        .wb_a(ba_ok), .wb_b(bb_ok),
+        .wb_a(ba_sched), .wb_b(bb_sched),
         .flush_valid(rob_flush_valid), .flush_rob(rob_flush_rob),
         .flush_dtail(rob_flush_dtail),
         .alu0_free(alu0_accept), .alu1_free(alu1_accept), .bru_free(bru_accept),
@@ -186,8 +199,8 @@ module core_ooo (
     // so a same-cycle PRF read would return the stale value). ps==0 (x0 / no
     // operand) is never bypassed — PRF[0] is the constant 0.
     wire        byp_en   = (cpu_pkg::WB_BYPASS != 0);
-    wire        ba_byp_v = byp_en && ba_ok.valid && (ba_ok.prf_tag != '0);
-    wire        bb_byp_v = byp_en && bb_ok.valid && (bb_ok.prf_tag != '0);
+    wire        ba_byp_v = byp_en && ba_sched.valid && (ba_ok.prf_tag != '0);
+    wire        bb_byp_v = byp_en && bb_sched.valid && (bb_ok.prf_tag != '0);
     wire [31:0] opa0 = (ba_byp_v && (iss0.ps1 == ba_ok.prf_tag)) ? ba_ok.result :
                        (bb_byp_v && (iss0.ps1 == bb_ok.prf_tag)) ? bb_ok.result : prf_r0;
     wire [31:0] opb0 = iss0.insn.uses_imm ? iss0.insn.imm :
@@ -471,4 +484,9 @@ module core_ooo (
         (rec_a_valid ? (ONE_C << rec_a_tag) : '0) |
         (rec_b_valid ? (ONE_C << rec_b_tag) : '0);
 
+`ifndef SYNTHESIS
+    always @(posedge clock)
+        if (!reset && !rob_flush_valid && lsu_wb_valid && !bb_ok.valid)
+            $fatal(1, "LSU scheduling result has no matching live ROB entry");
+`endif
 endmodule

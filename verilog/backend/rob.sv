@@ -38,6 +38,11 @@ module rob (
     input  cpu_pkg::writeback_t wb_b,
     output cpu_pkg::writeback_t wb_a_ok,
     output cpu_pkg::writeback_t wb_b_ok,
+    // Early scheduling checks. Architectural writeback/reclaim retain the
+    // complete kill filter; sched_b_candidate excludes the live LSU source.
+    input  cpu_pkg::writeback_t sched_b_candidate,
+    output wire        sched_a_match,
+    output wire        sched_b_match,
     output wire        rec_a_valid,
     output wire [$clog2(cpu_pkg::PRF_NUM)-1:0] rec_a_tag,
     output wire        rec_b_valid,
@@ -104,6 +109,12 @@ module rob (
     // been issued. The issued check rejects stale tag-0 writebacks (rd=x0
     // results carry pdst=0 just like stores / x0-destination ops, so a stale
     // result from a killed instruction could otherwise match a re-used slot).
+    // Registered producers can be checked before the late LSU bus selection.
+    // Scheduling ignores same-cycle kills; issue is disabled during recovery.
+    assign sched_a_match = v_q[wb_a.rob] && iss_q[wb_a.rob] &&
+                           (pdst_q[wb_a.rob] == wb_a.prf_tag);
+    assign sched_b_match = v_q[sched_b_candidate.rob] && iss_q[sched_b_candidate.rob] &&
+                           (pdst_q[sched_b_candidate.rob] == sched_b_candidate.prf_tag);
     wire a_ok = v_q[wb_a.rob] && !kkill[wb_a.rob] &&
                 (pdst_q[wb_a.rob] == wb_a.prf_tag) && iss_q[wb_a.rob];
     wire b_ok = v_q[wb_b.rob] && !kkill[wb_b.rob] &&
