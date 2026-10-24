@@ -65,7 +65,7 @@ module tb_div;
         do_one(-32'd17, -32'd5, 3'd6, -32'd2);         // -17%-5
         do_one(32'hffffffff, 32'd7, 3'd7, 32'd3);          // REMU 0xffffffff%7
         if (errors == 0) $display("[tb_div] ALL OK");
-        else $display("[tb_div] %0d errors", errors);
+        else $fatal(1, "[tb_div] %0d errors", errors);
         $finish;
     end
 endmodule

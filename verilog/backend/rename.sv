@@ -99,7 +99,7 @@ module rename (
     wire take0 = !flush_valid && in_valid[0] &&
                  (rob_space >= 'd1) && (iq_space != '0) &&
                  (need0 ? (free_cnt != '0) : 1'b1);
-    wire take1 = take0 && in_valid[1] &&
+    wire take1 = (cpu_pkg::DECODE_WIDTH == 2) && take0 && in_valid[1] &&
                  (rob_space >= 'd2) && (iq_space >= 'd2) &&
                  (need_all <= free_cnt) &&
                  (!need1 || (fe1 != '0));

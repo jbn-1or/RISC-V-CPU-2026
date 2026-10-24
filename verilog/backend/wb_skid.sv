@@ -12,7 +12,7 @@ module wb_skid #(
     output wire [2:0]  level           // occupancy; lets producers with no
                                        // backpressure keep beats lossless
 );
-    cpu_pkg::writeback_t mem [0:DEPTH-1];
+    logic [$bits(in)-1:0] mem [0:DEPTH-1];
     logic [1:0] head_q, tail_q;
     logic [2:0] cnt_q;
 

@@ -134,7 +134,7 @@ module rob (
     // ---------------- commit (in order, <=2/cycle) ----------------
     wire c0 = v_q[head_q] && d_q[head_q] && !flush_valid;
     wire [RB-1:0] h1 = head_q + 1'b1;
-    wire c1 = c0 && v_q[h1] && d_q[h1];
+    wire c1 = (cpu_pkg::DECODE_WIDTH == 2) && c0 && v_q[h1] && d_q[h1];
 
     assign cmt_free_mask =
         (c0 && (rd_q[head_q] != 5'd0) ? (ONE << old_q[head_q]) : '0) |
@@ -164,19 +164,37 @@ module rob (
         end
     end
 
-    always_comb begin
-        restore_valid = 32'b0;
-        restore_pdst  = '0;
-        for (int n = 1; n < cpu_pkg::ROB_DEPTH; n = n + 1) begin
-            logic [RB-1:0] i;
-            i = flush_rob + n[RB-1:0];
-            if (({1'b0, n[RB-1:0]} < dtail) && kkill[i] && (rd_q[i] != 5'd0) &&
-                !restore_valid[rd_q[i]]) begin
-                restore_valid[rd_q[i]] = 1'b1;
-                restore_pdst[rd_q[i]*PB +: PB] = old_q[i];
-            end
+    // Restore the old mapping of the OLDEST killed writer to each register.
+    // Scan physical slots in parallel, preferring slots above flush_rob before
+    // wrapping to zero. A balanced left-first tree replaces the serial scan
+    // of variable-indexed ROB reads and variable writes to the restore bus.
+    // That scan created a ROB-tail -> rename-map path longer than 6 ns.
+    wire [cpu_pkg::ROB_DEPTH-1:0] after_flush;
+    assign restore_valid[0] = 1'b0;
+    assign restore_pdst[0 +: PB] = '0;
+    generate
+        for (genvar i = 0; i < cpu_pkg::ROB_DEPTH; i = i+1) begin : g_after_flush
+            assign after_flush[i] = RB'(i) > flush_rob;
         end
-    end
+        for (genvar r = 1; r < 32; r = r+1) begin : g_restore
+            wire [cpu_pkg::ROB_DEPTH-1:0] candidate, eligible;
+            wire has_above = |(candidate & after_flush);
+            wire [2*cpu_pkg::ROB_DEPTH-1:1] node_valid;
+            wire [PB-1:0] node_data [1:2*cpu_pkg::ROB_DEPTH-1];
+            assign eligible = candidate & (has_above ? after_flush : {cpu_pkg::ROB_DEPTH{1'b1}});
+            for (genvar i = 0; i < cpu_pkg::ROB_DEPTH; i = i+1) begin : g_leaf
+                assign candidate[i] = kkill[i] && v_q[i] && (rd_q[i] == 5'(r));
+                assign node_valid[cpu_pkg::ROB_DEPTH+i] = eligible[i];
+                assign node_data[cpu_pkg::ROB_DEPTH+i] = old_q[i];
+            end
+            for (genvar n = 1; n < cpu_pkg::ROB_DEPTH; n = n+1) begin : g_node
+                assign node_valid[n] = node_valid[2*n] || node_valid[2*n+1];
+                assign node_data[n] = node_valid[2*n] ? node_data[2*n] : node_data[2*n+1];
+            end
+            assign restore_valid[r] = node_valid[1];
+            assign restore_pdst[r*PB +: PB] = node_valid[1] ? node_data[1] : '0;
+        end
+    endgenerate
 
     // ---------------- state ----------------
     wire [1:0] ndisp  = {1'b0, disp_valid[0]} + {1'b0, disp_valid[1]};

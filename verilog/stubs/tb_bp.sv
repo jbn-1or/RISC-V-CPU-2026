@@ -209,9 +209,35 @@ module tb_bp;
         s0_ret = 0; s0_v = 0;
         step(1);
 
+        // Restore the fetch-time history from PC-index XOR carried index.
+        // Check externally through lookup indices, including indirect-branch
+        // recovery which must restore history without shifting an outcome.
+        if (BP_GHR_BITS > 0) begin
+            for (int trial = 0; trial < 16; trial++) begin
+                logic [BHI-1:0] history, expected;
+                localparam int GW = (BP_GHR_BITS > 1) ? BP_GHR_BITS : 2;
+                localparam int GH = (GW < BHI) ? GW : BHI;
+                history = BHI'((trial * 37 + 3) & ((1 << GH)-1));
+                up_pc = 32'h2a4 + 32'(trial * 12);
+                up_ix = BHI'(up_pc >> 2) ^ history;
+                up_valid = 1'(trial & 1);
+                up_taken = 1'((trial >> 1) & 1);
+                expected = up_valid ? BHI'(((history << 1) | BHI'(up_taken)) & ((1 << GW)-1))
+                                    : history;
+                up_mispred = 1;
+                step(1);
+                up_mispred = 0; up_valid = 0;
+                settle();
+                chk((lk0_ix ^ BHI'(lk0_pc >> 2)) == expected,
+                    $sformatf("GHR recovery port0 trial=%0d", trial));
+                chk((lk1_ix ^ BHI'(lk1_pc >> 2)) == expected,
+                    $sformatf("GHR recovery port1 trial=%0d", trial));
+            end
+        end
+
         // ---------------- report ----------------
         if (errors == 0) $display("[tb_bp] ALL OK");
-        else             $display("[tb_bp] FAILED: %0d error(s)", errors);
+        else             $fatal(1, "[tb_bp] FAILED: %0d error(s)", errors);
         $finish;
     end
 endmodule

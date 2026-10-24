@@ -62,7 +62,7 @@ module tb_mul;
         do_one(32'hffffffff, 32'hffffffff, 3'd3, 32'hfffffffe);
         do_one(32'd7, 32'd11, 3'd3, 32'd0);
         if (errors == 0) $display("[tb_mul] ALL OK");
-        else $display("[tb_mul] %0d errors", errors);
+        else $fatal(1, "[tb_mul] %0d errors", errors);
         $finish;
     end
 endmodule

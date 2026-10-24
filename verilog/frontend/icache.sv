@@ -1,5 +1,5 @@
 // Instruction cache: 2 banks (even/odd line words) of
-// IC_LINES*(LINE_BYTES/8) words each, direct-mapped, one outstanding refill.
+// IC_LINES*(LINE_BYTES/8) words each, ASSOC ways, one outstanding refill.
 // A fetch block is 8 bytes (2 consecutive line words) and is served in one
 // pipelined read. On a miss the cache refills the whole line with
 // LINE_BYTES/4 back-to-back AXI reads and asserts busy (fetch stalls).
@@ -26,11 +26,13 @@ module icache (
     output wire        rd_rsp_ready
 );
     localparam int SETB = $clog2(cpu_pkg::IC_LINES);            // 7
+    localparam int IDXB = SETB - $clog2(cpu_pkg::ASSOC);
+    localparam int SETS = cpu_pkg::IC_LINES / cpu_pkg::ASSOC;
     localparam int OFFB = $clog2(cpu_pkg::LINE_BYTES);          // 4/5
     localparam int NW   = cpu_pkg::LINE_BYTES / 4;              // words per line 4/8
     localparam int WB   = $clog2(NW);                           // word index bits 2/3
     localparam int BB   = OFFB - 3;                             // 8B blocks per line bits 1/2
-    localparam int TAGB = 32 - SETB - OFFB;                     // 21/20
+    localparam int TAGB = 32 - IDXB - OFFB;
     localparam int CWB  = $clog2(NW + 1);                       // refill counter bits 3/4
     localparam int BD   = cpu_pkg::IC_LINES * (cpu_pkg::LINE_BYTES / 8);  // per-bank depth
 `ifndef SYNTHESIS
@@ -40,6 +42,7 @@ module icache (
 
     logic [cpu_pkg::IC_LINES-1:0] v_q;
     logic [TAGB-1:0] tag_q [0:cpu_pkg::IC_LINES-1];
+    logic [SETS-1:0] replace_q;
 
     // request latched last cycle (its data is on the banks this cycle)
     logic        pend_q;
@@ -54,8 +57,24 @@ module icache (
     logic [TAGB-1:0] rf_tag;
     localparam logic [CWB-1:0] RF_END = NW[CWB-1:0];
 
-    wire [SETB-1:0] req_set = req_addr[SETB+OFFB-1:OFFB];
-    wire [TAGB-1:0] req_tag = req_addr[31:SETB+OFFB];
+    wire [SETB-1:0] req_set;
+    wire [TAGB-1:0] req_tag = req_addr[31:IDXB+OFFB];
+    generate if (cpu_pkg::ASSOC == 1) begin : g_direct_index
+        assign req_set = req_addr[SETB+OFFB-1:OFFB];
+    end else begin : g_way_select
+        logic [SETB-1:0] row;
+        always_comb begin
+            row = {replace_q[req_addr[IDXB+OFFB-1:OFFB]], req_addr[IDXB+OFFB-1:OFFB]};
+            for (int way = cpu_pkg::ASSOC-1; way >= 0; way = way-1)
+                if (!v_q[SETB'((way << IDXB) | int'(req_addr[IDXB+OFFB-1:OFFB]))])
+                    row = SETB'((way << IDXB) | int'(req_addr[IDXB+OFFB-1:OFFB]));
+            for (int way = 0; way < cpu_pkg::ASSOC; way = way+1)
+                if (v_q[SETB'((way << IDXB) | int'(req_addr[IDXB+OFFB-1:OFFB]))] &&
+                    tag_q[SETB'((way << IDXB) | int'(req_addr[IDXB+OFFB-1:OFFB]))] == req_tag)
+                    row = SETB'((way << IDXB) | int'(req_addr[IDXB+OFFB-1:OFFB]));
+        end
+        assign req_set = row;
+    end endgenerate
     wire [BB-1:0]   req_blk = req_addr[OFFB-1:3];
 
     // ---------------- SRAM controls ----------------
@@ -95,13 +114,14 @@ module icache (
     // push all line words as fast as rdQ accepts them (rdQ pipelines);
     // busy clears only once all responses have been written back.
     assign rd_push_valid = busy_q && (rf_cnt != RF_END);
-    assign rd_push_addr  = {rf_tag, rf_set, rf_cnt[WB-1:0], 2'b00};
+    assign rd_push_addr  = {rf_tag, rf_set[IDXB-1:0], rf_cnt[WB-1:0], 2'b00};
     assign rd_push_idx   = {2'b00, rf_cnt[2:0]};
     assign rd_rsp_ready  = busy_q;
 
     always_ff @(posedge clock) begin
         if (reset) begin
             v_q <= '0;
+            replace_q <= '0;
             pend_q <= 1'b0;
             busy_q <= 1'b0;
             rf_cnt <= '0; rf_done <= '0;
@@ -118,6 +138,8 @@ module icache (
                 rf_cnt <= '0; rf_done <= '0;
                 rf_set <= req_set_q;
                 rf_tag <= req_tag_q;
+                if (cpu_pkg::ASSOC == 2)
+                    replace_q[req_set_q[IDXB-1:0]] <= !req_set_q[SETB-1];
             end
             // refill pushes
             if (rd_push_valid && rd_push_ready) rf_cnt <= rf_cnt + 1'b1;

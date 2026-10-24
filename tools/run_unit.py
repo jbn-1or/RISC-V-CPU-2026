@@ -21,6 +21,8 @@ def main():
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--appimage", default=str(DEFAULT_APPIMAGE))
     parser.add_argument("--verilator", help="explicit executable; skips AppImage")
+    parser.add_argument("--filelist", type=Path, default=ROOT / "verilog" / "filelist.f")
+    parser.add_argument("--out", type=Path, help="isolated output directory")
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
@@ -28,8 +30,8 @@ def main():
     try:
         if not args.verilator:
             enter_appimage(args.appimage)
-        sources = with_ram_source(read_sources(ROOT / "verilog" / "filelist.f"))
-        out = ROOT / "build" / f"ut_{args.top}"
+        sources = with_ram_source(read_sources(args.filelist))
+        out = (args.out or ROOT / "build" / f"ut_{args.top}").resolve()
         objects = out / "obj"
         out.mkdir(parents=True, exist_ok=True)
         # Generated dependencies contain paths into the transient AppImage mount.

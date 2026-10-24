@@ -28,7 +28,12 @@ module alu (
                 3'b010: r = {31'b0, $signed(in_a) < $signed(in_b)};
                 3'b011: r = {31'b0, (in_a < in_b)};
                 3'b100: r = in_a ^ in_b;
-                3'b101: r = in_funct7[5] ? (sa >>> shamt) : (in_a >> shamt);
+                // Keep the unsigned SRL operand out of the SRA expression's
+                // signedness context (a ternary here turns >>> into >>).
+                3'b101: begin
+                    if (in_funct7[5]) r = sa >>> shamt;
+                    else             r = in_a >> shamt;
+                end
                 3'b110: r = in_a | in_b;
                 3'b111: r = in_a & in_b;
                 default: r = 32'b0;

@@ -2,32 +2,34 @@
 // Module responsibilities and timing contracts: docs/architecture.md.
 package cpu_pkg;
 
-    // ---- Backend: validated Tier 3 configuration ----
-    // Widths describe this two-wide implementation, not arbitrary-width generators.
+    // ---- Backend configuration ----
+    // Supported widths: 1 or 2. Fetch/writeback retain two physical lanes;
+    // ISSUE_WIDTH bounds IQ grants, DECODE_WIDTH bounds rename and retirement.
     parameter int ISSUE_WIDTH = 2;
     parameter int ROB_DEPTH   = 32;
     parameter int PRF_NUM     = 64;
-    parameter int IQ_DEPTH    = 4;
+    parameter int IQ_DEPTH    = 8;
     // Wake/select in the writeback cycle; operands bypass directly from BA/BB.
     parameter int WB_BYPASS   = 1;
+    parameter int EARLY_REDIRECT = 0;  // registered recovery isolates issue from fetch
 
     parameter int DECODE_WIDTH = 2;     // 译码/重命名/提交宽度
-    parameter int LDQ_DEPTH    = 4;
+    parameter int LDQ_DEPTH    = 8;
     parameter int STQ_DEPTH    = 16;
     parameter int MUL_LAT      = 4;     // 乘法流水级数
     parameter int DIV_LAT_MAX  = 32;    // 除法迭代上限（radix-2，运行期提前退出）
 
-    // ---- Memory: direct-mapped I$/D$, 32-byte lines ----
+    // ---- Memory: 1/2-way I$/D$, fixed total capacity at each line count ----
     parameter int LINE_BYTES   = 32;    // 行大小（16 或 32 B：4/8 × AXI 字）
-    parameter int IC_LINES     = 128;   // I$ 组内行数（总行 = ×ASSOC）
-    parameter int DC_LINES     = 1024;  // D$ 32KB；须为 2 的幂
-    parameter int ASSOC        = 1;     // 相联度（1=直接映射）
+    parameter int IC_LINES     = 64;    // total I$ lines, across all ways
+    parameter int DC_LINES     = 512;   // D$ 16 KiB; power of two
+    parameter int ASSOC        = 1;     // 1=direct mapped, 2=two-way round robin
     parameter int MSHR_N       = 2;     // D$ 未命中合并项
     parameter int AXI_MAX_RD   = 8;     // 在飞 AXI 读上限（≤ 从机队列 16 − 裕量）
     parameter int AXI_MAX_WR   = 8;     // 在飞 AXI 写上限
     // ---- Branch prediction ----
     parameter int BHT_ENTRIES  = 256;
-    parameter int BTB_ENTRIES  = 128;
+    parameter int BTB_ENTRIES  = 64;
     parameter int RAS_DEPTH    = 16;
     // gshare GHR width: BHT index = pc[index] ^ ghr. 0 = plain pc-indexed BHT.
     // History folded into the index is min(BP_GHR_BITS, log2(BHT_ENTRIES));

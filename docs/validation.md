@@ -1,120 +1,88 @@
-# 验证与复现
+**2026-10-24：当前默认 CPU 在官方流程下同时达到 Tier 3 的面积、频率和 IPC 门槛。** 唯一要求来源为恢复后的官方 [README-EN.md](../README-EN.md)。面积/频率与 IPC 对应同一份最终生产 RTL，输入 SHA256 已核对。
 
-Tier 3 需要同一份 RTL 同时满足：**面积 <36,000 µm²、频率 >300 MHz、LATENCY=10 的六项性能测试 IPC 几何平均 ≥1.0985**。频率来自课程 Yosys/ABC/ASAP7/OpenSTA 流程，采用理想时钟、无布线寄生模型；不是布局布线后的实测频率。
+| 指标 | 最终实测 | Tier 3 门槛 |
+| --- | ---: | ---: |
+| 总面积，含 SRAM | **30186.042410 µm²** | <36,000 µm² |
+| 综合频率 | **300.822562 MHz** | >300 MHz |
+| 最小周期 | **3.32421875000 ns** | <3.333333333 ns |
+| LAT=10 六项 IPC 几何平均 | **1.104759628915139** | ≥1.0985 |
+| 官方正确性 | **19/19** | 通过 |
+| LAT=1/50 延迟矩阵 | **8/8** | 全部通过 |
+| RV32IM 自检 | **5,307 项 × LAT=1/10/50** | 全部通过 |
+| 单元测试 | **14/14** | 全部通过 |
 
-## 完整回归
+IPC 比面积/频率阶段的 0.896022346877662 提高 **23.30%**。频率是课程默认理想时钟、无布线寄生的综合 STA 结果，未进行布局布线。2 ns 是综合优化目标；Tier 3 按实测最小周期和频率判断。
 
-在仓库根目录执行，工具链位置由 `config.mk` 设置。首次使用先运行 `git submodule update --init --recursive`，并安装课程 AppImage 或指定本机工具。
+当前频率距门槛约 0.823 MHz；结果对应本页记录的源码 SHA256、默认官方工具和约束，后续 RTL 变更需要重新综合。
+
+**最终配置与实现**
+
+双发射/双提交，ROB32、PRF64、IQ8、LDQ8、STQ16、MUL_LAT=4，I$ 64 行（2 KiB）、D$ 512 行（16 KiB）、32 B line、直接映射、2 MSHR、BHT256、BTB64、RAS16。`WB_BYPASS=1`，`EARLY_REDIRECT=0`。
+
+恢复同拍旁路与较大的调度窗口；保留寄存的前端恢复。IQ 使用并行年龄检查及两级轮转资格掩码，保持原发射次序和功能单元约束。LSQ 将 guard/load/完成候选改为并行年龄比较和资格掩码归约；恢复拍暂停 load 调度，保留较老 load，退休 store 继续 drain。完整设计取舍见 [report.md](report.md) 与 [architecture.md](architecture.md)。
+
+此前修复的 SRA/SRAI、结构体数组展开、真实参数化、ROB 并行恢复和 store 同拍数据捕获均保留。另修复 ROB64 下 IFB 的半环恢复边界：恢复时直接清空所有尚未分派的年轻 IFB 项。最终没有引入分配回绕位、原始写回唤醒或额外 store 流水级。
+
+**官方文件与已知问题**
+
+README-EN.md、README-ZH.md、config.mk 与 upstream/main 一致；Makefile、scripts/、官方接口文档、Dockerfile、packaging/、测试子模块及 .gitmodules 未改变。未修改官方工具链、库、SRAM 成本模型或时序约束以取得结果。
+
+[KI-001：部分基准门级/RTL 周期差异](known-issues.md) 已定位并修复。BP 的连续位切片在 Verilator/Yosys 中产生不同 PC 位连接，改为单次切片后，原有 RTL 六项计数不变，实际综合网表的 24 个官方用例（最终门级集不含 π）和 8 个延迟边界用例均与 RTL 周期一致。门级 5,307 项 ISA 自检在 LAT=1/10/50 均通过，三组周期也与 RTL 相同。此为已测程序的功能与周期检查，未宣称形式化等价。
+
+**复现与审计**
 
 ```sh
-make build JOBS=8 BUILD=build/check
-make test SIM=build/check/sim MAX_CYCLES=20000000 LATENCY=10 > build/check_test.log 2>&1
-make perf SIM=build/check/sim MAX_CYCLES=20000000 LATENCY=10 > build/check_perf.log 2>&1
-python3 tools/run_latency.py --sim build/check/sim --log build/check_latency.log
-python3 tools/run_unit.py tb_lsu --jobs 8
-python3 tools/run_unit.py tb_dcache_recovery --jobs 8
-python3 tools/run_unit.py tb_axi_write --jobs 8
-make synth MODE=opt SYNTH_OUT=build/synth_check
-python3 tools/check_tier3.py --synth build/synth_check/opt \
+make code BUILD=build/check/sim JOBS=4
+make test SIM=./code MAX_CYCLES=20000000 LATENCY=10
+make perf SIM=./code MAX_CYCLES=20000000 LATENCY=10 > build/check_perf.log
+python3 tools/run_latency.py --sim ./code --log build/check_latency.log
+python3 tools/run_isa.py --sim ./code --out build/check_isa
+python3 tools/run_unit.py tb_lsq_recovery
+python3 tools/run_unit.py tb_lsu
+make synth SYNTH_OUT=build/check_synth
+python3 tools/check_tier3.py --synth build/check_synth/opt \
   --perf-log build/check_perf.log --out build/check_audit.json
 ```
 
-通过 `SIM=` 复用刚编译的仿真器。需要指定外部测试目录时，make 使用 `TESTCASES=/path/to/testcases`，延迟脚本使用 `--testcases /path/to/testcases`。Verilator 对象目录在每次构建时重建，避免旧 AppImage 挂载路径失效。
+严格审计默认检查三项门槛及实际展开的 BP 恢复 PC 位连接，最终 `passed=true`、`tier3_passed=true`。不使用只检查面积/频率的阶段模式。源码哈希、原生 `opt` 及 SHARE、完整 IFB/IQ/写回 FIFO、SRAM 宏和地址驱动、无 ERROR/latch/端口 resize 均通过。当前 IFB 为 8×152 bits，IQ 指令存储为 8×104 bits，每个写回 FIFO 为 4×44 bits；D$ 有 32 个 `512x8` 宏，物理地址 9 位全部驱动，I$ 有两个 `256x32` 宏。
 
-| 检查 | 验收内容 |
-| --- | --- |
-| `make test` | 官方正确性用例 19/19；`pi` 等长程序需要提高周期上限 |
-| `make perf` | median、multiply、qsort、rsort、towers、vvadd 六项，LAT=10 |
-| `run_latency.py` | magic、queens、tak、qsort ×LAT=1/50，共 8 项 |
-| `tb_lsu` | load/store queue、D$、AXI 集成和访存定向检查 |
-| `tb_dcache_recovery` | 返回与 flush 同拍时，背压跨越恢复后不得向复用的 ROB 号返回旧数据；较老 load 仍须完成 |
-| `tb_axi_write` | 256 笔写、AW/W 独立停顿、payload 稳定、B tag 顺序、无背压每拍一笔 |
-| `make synth` | 默认 `opt`，保留资源分享；检查时序与面积 |
-| `check_tier3.py` | 三项门槛、报告输入 SHA256、D$ 宏数量/地址驱动及综合错误检查 |
+| 基准 | 动态指令 | 周期 |
+| --- | ---: | ---: |
+| perf_median | 6,961 | 8,201 |
+| perf_multiply | 21,722 | 18,474 |
+| perf_qsort | 139,900 | 159,846 |
+| perf_rsort | 195,719 | 132,054 |
+| perf_towers | 5,278 | 4,937 |
+| perf_vvadd | 4,524 | 3,444 |
 
-审计工具从指令数/周期数重新计算完整精度 IPC，不使用表格里四位小数的 IPC。它检查综合与性能日志，正确性、延迟矩阵和协议测试仍须分别执行。性能日志应来自同一轮构建；不要将其他分支或不同队列配置的 IPC 与当前时序报告拼接。
+几何平均由整数指令/周期数重新计算，未使用四位小数 IPC 反算。
 
-## 综合口径与结构检查
+最终产物位于 `build/final_compliance/`（Git 忽略）：`rtl/` 为最终 RTL 回归，`synth/opt/` 为官方默认综合，`final_audit.json` 为严格审计，`units/` 为 14 个单测，`variants/` 为最终八参数变体，`build/cycle_audit/bp_matrix/` 为六配置下的 RTL/Yosys BP 测试，`gate/` 为实际网表模型，`after_cycles.json` 和 `after_latency_cycles.json` 为 24+8 个周期比较，`gate_isa/` 为门级 ISA 自检。`verification.json` 汇总源码/仿真器/网表 SHA256、全部结果与官方文件边界；根目录 `code` 由相同生产源生成。
 
-`config.mk` 默认使用 [`tools/yosys_keepdc`](../tools/yosys_keepdc)。该包装器展开内置 `synth` pass 序列，在 `opt -full` 中加入 `-keepdc`，保留默认 `share`。此配置用于避免本工具版本对 D$ 的 don't-care 优化删除缓存或错误缩减 10-bit set 地址；不修改课程 `scripts/`。
+八个最终参数变体分别通过官方正确性 19/19 和性能 6/6；默认最终版本完整执行 ISA、延迟、单测和门级比较。此前 IPC 优化与参数探索的历史记录保留在 `build/ipc_tier3/`。
 
-即使 RTL 行为等价，信号名、表达式和模块组织变化也可能改变优化顺序及 ABC 映射。因此重构后必须重新综合，不直接沿用旧频率。正常报告应包含：
+```sh
+python3 tools/run_configs.py --configs issue1 assoc2 rob16 rob64 iq4 prf128 decode1 cache_small \
+  --benchmark-only --out build/configs --jobs 2 --parallel 2
+```
 
-- 32 个 `fakeram_asap7_1024x8` D$ 宏，所有 `addr_in` 均为 10 位、无常量/未驱动地址位；另有两个 `fakeram_asap7_512x32` I$ 宏。
-- 无综合 ERROR、推断 latch 或 SRAM 端口 resize。
-- 输入 SHA256 与当前 RTL 一致。
-- 面积包含 logic 和 SRAM；最小周期及关键路径可在 `report.json`、`timing.rpt` 中检查。
+省略 `--benchmark-only` 会补充每个变体的 ISA 和延迟矩阵；`--perf-only` 仅用于筛选，不提供正确性证据。
 
-`check_tier3.py` 针对当前 32 KiB D$ 配置检查 32 个宏；若正式改变容量，需要同时更新结构预期及重新验证指标。
+**历史结果边界**
 
-## 当前验证结果（频率裕量优化）
+面积/频率阶段的 28,683.281810 µm²、375.779817 MHz、IPC 0.896022346877662 保留在 `build/fix_tier3/`。该阶段没有达到完整 Tier 3，当前记录已取代它。先前依赖错误结构体数组展开或 keepdc 包装器的 PPA 已撤回，不能与有效 RTL 的 IPC 混用。
 
-2026-10-23，以 `8f2de41` 为基线，保持队列参数、双发射/双提交、缓存容量和全部流水线延迟。使用默认 `MODE=opt`、资源分享和 `CLOCK_PERIOD_NS=2.0` 重新综合。
+**综合语义回归与门级复现**
 
-| 指标 | 优化前 | 当前版本 | 目标 |
-| --- | ---: | ---: | --- |
-| 面积 / µm² | 28,778.756 | **28,659.579** | <36,000 |
-| 综合频率 / MHz | 303.858 | **333.225** | 本轮约 330；Tier 3 >300 |
-| 最小周期 / ns | 3.291015625 | **3.0009765625** | <3.333333333 |
-| IPC 几何平均 | 1.102294 | **1.102294** | ≥1.0985 |
-| 正确性 / LAT=1/50 | 19/19、8/8 | **19/19、8/8** | 全部通过 |
+```sh
+python3 tools/check_bp_recovery.py --out build/check_bp
+python3 tools/build_gate.py --synth build/check_synth/opt --out build/check_gate --jobs 4
+python3 tools/compare_cycles.py --rtl ./code --gate build/check_gate/sim/sim \
+  --exclude-cases correctness_pi --out build/check_cycles.json --jobs 4
+python3 tools/compare_cycles.py --rtl ./code --gate build/check_gate/sim/sim \
+  --cases correctness_magic correctness_queens correctness_tak correctness_qsort \
+  --latencies 1 50 --out build/check_latency_cycles.json --jobs 4
+python3 tools/run_isa.py --sim build/check_gate/sim/sim --out build/check_gate_isa
+```
 
-频率提高约 9.66%，相对 300 MHz 门槛的余量约 11.07%。六项性能基准的指令数和周期数与 `8f2de41` 完全一致；完整精度 IPC 为 `1.1022941378197337`。
-
-实现集中在两处：响应 payload 的选择/字节提取提前完成，晚到的 hit/replay 只限定有效性；写回调度资格在最终 BB 选择前完成，LSU 直接使用其在飞队列身份。PRF 写入、ROB 完成和回收保留原有完整检查，仿真断言持续验证 LSU 身份前提。
-
-同时修复 FIFO 入队与 flush 同拍的 kill 标记遗漏。新增定向测试在原版本复现了 `token=4` 的旧数据返回到复用 ROB 号的问题；本版验证被杀死响应丢弃、较老 load 保留。LSU、后端连接和新恢复测试均通过。
-
-结构审计通过：32 个 D$ SRAM 宏、10 位地址完整驱动、无 ERROR/latch/端口 resize，报告输入 SHA256 匹配当前 RTL。
-
-| 本轮产物 | 路径 |
-| --- | --- |
-| 仿真器 / 构建日志 | `build/sim_freq330_verified/sim`、`build/build_freq330_verified.log` |
-| 正确性 / IPC | `build/test_freq330_verified.log`、`build/perf_freq330_verified.log` |
-| 延迟矩阵 | `build/latency_freq330_verified.log`、`build/latency_freq330_verified_summary.log` |
-| LSU / 恢复边界 | `build/lsu_freq330_verified.log`、`build/recovery_freq330_verified.log` |
-| 后端连接 | `build/be_freq330_final.log` |
-| 综合 | `build/synth_freq330_verified/opt/{report.json,report.txt,timing.rpt,design.json,mapped.v}` |
-| 审计 / 汇总 | `build/audit_freq330_verified.json`、`build/verification_freq330.json` |
-| 冻结 RTL | `build/rtl_freq330_verified/` |
-
-## 历史基线（可读性重构）
-
-重构前基线为 `9fcb1d7`（`tier3-throughput`）：28,456.713 µm²、310.491 MHz、IPC 1.102294；正确性 19/19、延迟回归 8/8、AXI 定向检查通过。
-
-2026-10-23，`refactor-readability` 工作目录重新构建和综合，结果如下。发射策略、队列深度和流水线延迟保持原配置。
-
-| 指标 | 重构前 `9fcb1d7` | 重构版 | 门槛 |
-| --- | ---: | ---: | --- |
-| 面积 / µm² | 28,456.713 | **28,778.756** | <36,000 |
-| 综合频率 / MHz | 310.491 | **303.858** | >300 |
-| 最小周期 / ns | 3.220703125 | **3.291015625** | <3.333333333 |
-| IPC 几何平均 | 1.102294 | **1.102294** | ≥1.0985 |
-| 正确性 | 19/19 | **19/19** | 全部通过 |
-| LAT=1/50 矩阵 | 8/8 | **8/8** | 全部通过 |
-
-LSU、后端连接、默认桩连接和 256 笔 AXI 写通道定向测试通过。综合结构审计通过：D$ 宏 32 个、地址均为 10 位且全部有驱动，输入 SHA256 匹配，无 ERROR、latch 或端口 resize。
-
-本轮本地产物（`build/` 不纳入 Git）：
-
-| 产物 | 路径 |
-| --- | --- |
-| 仿真器及构建日志 | `build/readable_final_sim/sim`、`build/readable_final_build.log` |
-| 正确性 / IPC | `build/readable_final_test.log`、`build/readable_final_perf.log` |
-| 延迟矩阵 | `build/readable_final_latency.log`、`build/readable_final_latency_summary.log` |
-| LSU / 后端连接 | `build/readable_final_lsu.log`、`build/readable_final_be_link.log` |
-| AXI / 默认桩连接 | `build/readable_axi.log`、`build/readable_stub_link.log` |
-| 综合报告 | `build/synth_readable_final/opt/{report.json,report.txt,timing.rpt,design.json,mapped.v}` |
-| 自动门槛审计 | `build/readable_final_audit.json` |
-| 验证汇总 / RTL 快照 | `build/readable_final_verification.json`、`build/rtl_readable_final/` |
-
-两版一致的六项计数如下，IPC 几何平均完整精度为 `1.1022941378197337`。
-
-| 基准 | 指令数 | 周期数 | IPC |
-| --- | ---: | ---: | ---: |
-| perf_median | 6961 | 8164 | 0.852646 |
-| perf_multiply | 21722 | 17867 | 1.215761 |
-| perf_qsort | 139900 | 142686 | 0.980475 |
-| perf_rsort | 195719 | 124758 | 1.568789 |
-| perf_towers | 5278 | 5086 | 1.037751 |
-| perf_vvadd | 4524 | 4173 | 1.084112 |
+BP 定向测试覆盖条件分支与间接跳转的历史恢复，默认、GHR=0/1/4/12 和 BHT128 六组配置在 RTL 与原生 Yosys 输出上均通过。旧版本原生展开的 32 项恢复检查失败，修复后的严格审计新增 `bp_recovery_pc_slice_correct`，会拒绝旧的错误位连接。

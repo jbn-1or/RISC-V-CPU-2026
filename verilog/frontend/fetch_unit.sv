@@ -1,6 +1,6 @@
 // Frontend fetch unit: PC generation, icache request,
 // instruction fetch buffer (IFB, 8 entries), JAL/RAS-return redirect and flush
-// truncation.
+// clearing.
 //
 // Request protocol (pipelined, miss-safe):
 //   the icache is a 1-cycle SRAM read, so one 8B block is requested every
@@ -196,8 +196,9 @@ module fetch_unit (
         .s1_hit(bp_s1_hit), .s1_top(bp_s1_top));
 
     // ---------------- IFB ----------------
-    cpu_pkg::fe2rn_t ifb_mem [0:7];
-    logic [5:0]  ifb_bsf [0:7];   // parallel bsf for variable-index flush scan
+    // Plain packed words avoid Yosys' native frontend interpreting an
+    // unpacked array of package structs as one struct with a bit index.
+    logic [$bits(fe0)-1:0] ifb_mem [0:7];
     logic [2:0]  ifb_head, ifb_tail;
     logic [3:0]  ifb_cnt;
 
@@ -238,25 +239,6 @@ module fetch_unit (
         eB.bix = bp_lk1_ix;
     end
     wire [5:0] B_bsf = first_bsf + {5'b0, dec_d0.is_branch};
-
-    // flush drop: cut the IFB tail at the first younger entry (valid range only)
-    logic [2:0] cut;
-    always_comb begin
-        logic found;
-        cut = ifb_tail;
-        found = 1'b0;
-        for (int k = 0; k < 8; k = k + 1) begin
-            logic [2:0] i;
-            logic [5:0] dvec;
-            i = ifb_head + k[2:0];
-            dvec = ifb_bsf[i] - flush.bsf;
-            if (!found && (k[3:0] < ifb_cnt) && (dvec != 6'd0) && (dvec <= 6'd32)) begin
-                cut = i;
-                found = 1'b1;
-            end
-        end
-    end
-    wire [3:0] cnt_after_cut = cut - ifb_head;
 
     always_ff @(posedge clock) begin
         if (reset) begin
@@ -314,13 +296,15 @@ module fetch_unit (
 
             // ---- IFB update ----
             if (flush.valid) begin
-                if (cnt_after_cut != ifb_cnt) begin
-                    ifb_tail <= cut;
-                    ifb_cnt  <= cnt_after_cut;
-                end
+                // Fetch/rename dispatch in order. A resolving branch has
+                // already left the IFB, so every buffered instruction is
+                // younger. Clear all entries without a half-ring age bound;
+                // larger ROB windows can exceed that bound or wrap bsf.
+                ifb_tail <= ifb_head;
+                ifb_cnt <= '0;
             end else begin
-                if (A_valid) begin ifb_mem[ifb_tail] <= eA; ifb_bsf[ifb_tail] <= eA.bsf; end
-                if (B_valid) begin ifb_mem[ifb_tail + 3'd1] <= eB; ifb_bsf[ifb_tail + 3'd1] <= eB.bsf; end
+                if (A_valid) ifb_mem[ifb_tail] <= eA;
+                if (B_valid) ifb_mem[ifb_tail + 3'd1] <= eB;
                 ifb_tail <= ifb_tail + n_push;
                 ifb_head <= ifb_head + n_pop;
                 ifb_cnt  <= ifb_cnt + {2'b0, n_push} - {2'b0, n_pop};

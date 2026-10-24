@@ -1,4 +1,4 @@
-// Data cache: direct-mapped, DC_LINES x LINE_BYTES lines,
+// Data cache: ASSOC ways, DC_LINES total x LINE_BYTES lines,
 // write-through and no-write-allocate, byte-write masks, MSHR_N outstanding
 // line fills with keyword-first completion, and a kill bit that drops a
 // flushed waiter's response. One 1RW SRAM port per line word (LINE_BYTES/4
@@ -81,10 +81,13 @@ module dcache (
     output wire        rd_rsp_ready,
 );
     localparam int SETB = $clog2(cpu_pkg::DC_LINES);    // set index bits (10 at DC_LINES=1024)
+    localparam int WAYB = $clog2(cpu_pkg::ASSOC);
+    localparam int IDXB = SETB - WAYB;                // address set bits
+    localparam int SETS = cpu_pkg::DC_LINES / cpu_pkg::ASSOC;
     localparam int OFFB = $clog2(cpu_pkg::LINE_BYTES);  // 4/5
     localparam int NW   = cpu_pkg::LINE_BYTES / 4;      // words per line 4/8
     localparam int WB   = $clog2(NW);                   // word index bits 2/3
-    localparam int TAGB = 32 - SETB - OFFB;             // address tag bits (17 at 32-byte lines)
+    localparam int TAGB = 32 - IDXB - OFFB;
     // Cached lines always have addr[31:28] == 0 (is_uncached() is exactly
     // addr[31:28] != 0), so the top four tag bits are constant zero for every
     // valid tag entry. Store/compare only the low CTAGB bits.
@@ -114,12 +117,51 @@ module dcache (
     // ---------------- tag / valid arrays ----------------
     logic [cpu_pkg::DC_LINES-1:0] v_q;
     logic [CTAGB-1:0] tag_q [0:cpu_pkg::DC_LINES-1];
+    // A physical row is {way, address set}; SRAM capacity stays fixed when
+    // changing associativity. MSHRs own physical rows, so independent ways
+    // can refill without overwriting each other.
+    logic [SETS-1:0] replace_q;
+    wire [SETB-1:0] lk_row, su_row;
+    generate if (cpu_pkg::ASSOC == 1) begin : g_direct_index
+        assign lk_row = lk_addr[SETB+OFFB-1:OFFB];
+        assign su_row = su_addr[SETB+OFFB-1:OFFB];
+        assign probe_set_valid = !cpu_pkg::is_uncached(probe_addr) &&
+                                 v_q[probe_addr[SETB+OFFB-1:OFFB]];
+    end else begin : g_way_select
+        logic [SETB-1:0] lr, sr;
+        logic pv;
+        always_comb begin
+            lr = {replace_q[lk_addr[IDXB+OFFB-1:OFFB]], lk_addr[IDXB+OFFB-1:OFFB]};
+            sr = SETB'(su_addr[IDXB+OFFB-1:OFFB]);
+            pv = 1'b0;
+            // Prefer an invalid way, then a matching valid way. A same-line
+            // in-flight fill takes precedence so its waiter merge is reused.
+            for (int way = cpu_pkg::ASSOC-1; way >= 0; way = way-1) begin
+                if (!v_q[SETB'((way << IDXB) | int'(lk_addr[IDXB+OFFB-1:OFFB]))])
+                    lr = SETB'((way << IDXB) | int'(lk_addr[IDXB+OFFB-1:OFFB]));
+            end
+            for (int way = 0; way < cpu_pkg::ASSOC; way = way+1) begin
+                if (v_q[SETB'((way << IDXB) | int'(lk_addr[IDXB+OFFB-1:OFFB]))] &&
+                    tag_q[SETB'((way << IDXB) | int'(lk_addr[IDXB+OFFB-1:OFFB]))] == lk_addr[27:IDXB+OFFB])
+                    lr = SETB'((way << IDXB) | int'(lk_addr[IDXB+OFFB-1:OFFB]));
+                if (v_q[SETB'((way << IDXB) | int'(su_addr[IDXB+OFFB-1:OFFB]))] &&
+                    tag_q[SETB'((way << IDXB) | int'(su_addr[IDXB+OFFB-1:OFFB]))] == su_addr[27:IDXB+OFFB])
+                    sr = SETB'((way << IDXB) | int'(su_addr[IDXB+OFFB-1:OFFB]));
+                pv = pv | v_q[SETB'((way << IDXB) | int'(probe_addr[IDXB+OFFB-1:OFFB]))];
+            end
+            for (int s = 0; s < MN; s = s+1)
+                if (m_valid[s] && !m_bypass[s] &&
+                    m_set[s][IDXB-1:0] == lk_addr[IDXB+OFFB-1:OFFB] &&
+                    m_tag[s] == lk_addr[31:IDXB+OFFB]) lr = m_set[s];
+        end
+        assign lk_row = lr;
+        assign su_row = sr;
+        assign probe_set_valid = !cpu_pkg::is_uncached(probe_addr) && pv;
+    end endgenerate
 
     // Probe set validity, a safe superset of a tag hit. A false positive
     // only permits a normal cache lookup, which can still miss or replay.
     // Avoid a wide tag mux on the same-cycle LSQ guard path.
-    assign probe_set_valid = !cpu_pkg::is_uncached(probe_addr) &&
-                       v_q[probe_addr[SETB+OFFB-1:OFFB]];
 
     // ---------------- lookup pipeline (1-cycle SRAM read) ----------------
     // The tag half of the lookup is read in the op-register cycle and parked
@@ -245,7 +287,7 @@ module dcache (
             end
     end
     wire [2:0] push_word = m_bypass[push_slot] ? m_trig[push_slot] : m_pushcnt[push_slot][2:0];
-    wire [31:0] push_addr_s = {m_tag[push_slot], m_set[push_slot], push_word[WB-1:0], 2'b00};
+    wire [31:0] push_addr_s = {m_tag[push_slot], m_set[push_slot][IDXB-1:0], push_word[WB-1:0], 2'b00};
     assign rd_push_valid = push_en;
     assign rd_push_addr  = push_addr_s;
     assign rd_push_idx   = {push_slot, push_word};    // {slot[1:0], word[2:0]}
@@ -274,7 +316,7 @@ module dcache (
     always_comb begin
         su_set_busy = 1'b0;
         for (int s = 0; s < MN; s = s + 1)
-            if (m_valid[s] && (m_set[s] == su_addr[SETB+OFFB-1:OFFB]))
+            if (m_valid[s] && (m_set[s][IDXB-1:0] == su_addr[IDXB+OFFB-1:OFFB]))
                 su_set_busy = 1'b1;
     end
     assign su_stall = su_set_busy;
@@ -282,8 +324,7 @@ module dcache (
     // A stage: select the single operation for this cycle and capture it.
     wire [2:0]      acc_word = lk_acc ? lk_addr[OFFB-1:2] :
                                su_acc ? su_addr[OFFB-1:2] : rword;
-    wire [SETB-1:0] acc_set = lk_acc ? lk_addr[SETB+OFFB-1:OFFB] :
-                              su_acc ? su_addr[SETB+OFFB-1:OFFB] : m_set[rslot];
+    wire [SETB-1:0] acc_set = lk_acc ? lk_row : su_acc ? su_row : m_set[rslot];
     wire            a_set_fill = b_refill_last && (m_set[b_slot] == acc_set);
     wire [31:0]     acc_wdata = su_acc ? su_data : rd_rsp_data;
     wire [3:0]      acc_wmask = su_acc ? su_strb : 4'hf;
@@ -467,6 +508,7 @@ module dcache (
     always_ff @(posedge clock) begin
         if (reset) begin
             v_q <= '0;
+            replace_q <= '0;
             for (int b = 0; b < TBN; b = b + 1) tag_a_bank_q[b] <= '0;
             valid_a_bank_q <= '0;
             for (int b = 0; b < TBN; b = b + 1) tag_b_bank_q[b] <= '0;
@@ -509,8 +551,8 @@ module dcache (
             // load/store/refill input arbitration mux in their address path.
             if (su_acc) begin
                 for (int b = 0; b < TBN; b = b + 1) begin
-                    tag_a_bank_q[b] <= tag_q[SETB'((b << TRB) | int'(su_addr[OFFB+TRB-1:OFFB]))];
-                    valid_a_bank_q[b] <= v_q[SETB'((b << TRB) | int'(su_addr[OFFB+TRB-1:OFFB]))];
+                    tag_a_bank_q[b] <= tag_q[SETB'((b << TRB) | int'(su_row[TRB-1:0]))];
+                    valid_a_bank_q[b] <= v_q[SETB'((b << TRB) | int'(su_row[TRB-1:0]))];
                     // Forward a fill published at the same edge as the A read.
                     // These are the only writes to tag_q, so B sees the same
                     // tag as a fresh read of tag_q[op_set_q] one cycle later.
@@ -582,14 +624,18 @@ module dcache (
                 m_wkill[alloc_slot]  <= '0;
                 m_trig_done[alloc_slot] <= 1'b0;
                 if (!pend_unc) v_q[pend_set_q] <= 1'b0;
+                if (!pend_unc && cpu_pkg::ASSOC == 2)
+                    replace_q[pend_set_q[IDXB-1:0]] <= !pend_set_q[SETB-1];
             end
 
             // ---- store-completion invalidate (line may hold a stale fill) ----
             // Set-only clear is a safe superset of the tag-matched invalidate:
             // the store already wrote through, so dropping any line in this set
             // cannot lose data and only costs a later refill.
-            if (inv_valid && !cpu_pkg::is_uncached(inv_addr))
-                v_q[inv_addr[SETB+OFFB-1:OFFB]] <= 1'b0;
+            if (inv_valid && !cpu_pkg::is_uncached(inv_addr)) begin
+                for (int way = 0; way < cpu_pkg::ASSOC; way = way+1)
+                    v_q[SETB'((way << IDXB) | int'(inv_addr[IDXB+OFFB-1:OFFB]))] <= 1'b0;
+            end
 
             // ---- P0-mwaiter: park the pending lookup's token ----
             // Gated by pend_kill: a token flushed while registering would not be
@@ -612,7 +658,7 @@ module dcache (
             op_slot_q   <= op_refill_sel ? rslot : 2'd0;
             op_word_q   <= acc_word;
             op_set_q    <= acc_set;
-            op_tag_q    <= lk_acc ? lk_addr[31:SETB+OFFB] : su_addr[31:SETB+OFFB];
+            op_tag_q    <= lk_acc ? lk_addr[31:IDXB+OFFB] : su_addr[31:IDXB+OFFB];
             op_tok_q    <= lk_token;
             op_wdata_q  <= acc_wdata;
             op_wmask_q  <= acc_wmask;

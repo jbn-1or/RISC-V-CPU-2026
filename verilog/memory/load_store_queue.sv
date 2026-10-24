@@ -201,20 +201,10 @@ module load_store_queue (
     wire [31:0] in_vaddr = in_base + in_imm;
     wire [1:0]  in_off   = in_vaddr[1:0];
 
-    // ---------------- flush kill masks (same-cycle guard) ----------------
-    // The latched candidates below are chosen combinationally; a flush in the
-    // same cycle would kill the picked entry after the latch decision, leaving
-    // a stale selector. Filter the latch predicates with these masks.
-    logic [DQ-1:0] ld_kill_mask;
-    logic [SQ-1:0] st_kill_mask;
-    always_comb begin
-        for (int i = 0; i < DQ; i = i + 1)
-            ld_kill_mask[i] = flush_valid && l_valid[i] &&
-                              cpu_pkg::flush_younger(l_rob[i], flush_rob, flush_dtail);
-        for (int i = 0; i < SQ; i = i + 1)
-            st_kill_mask[i] = flush_valid && s_valid[i] && !s_ret[i] &&
-                              cpu_pkg::flush_younger(s_rob[i], flush_rob, flush_dtail);
-    end
+    // Load issue and selection state pause on recovery. The queue kill at
+    // the edge clears younger entries, so per-entry kill comparisons need not
+    // precede the forwarding/guard/oldest-load selection path. Retired stores
+    // continue draining: recovery cannot revoke their architectural effects.
 
     // ---------------- program-order keys ----------------
     // Retired stores are older than all live ROB entries, but may outlive
@@ -296,7 +286,7 @@ module load_store_queue (
     // latched drain candidate (payload must be stable until accepted)
     logic        st_v;
     logic [SB-1:0] st_i;
-    wire [SQ-1:0]  drain_ok = drain_mask & ~st_kill_mask;
+    wire [SQ-1:0]  drain_ok = drain_mask;
     wire [SQ-1:0]  st_cand = st_v ? ({{(SQ-1){1'b0}}, 1'b1} << st_i) : drain_ok;
 
     always_comb begin
@@ -375,19 +365,25 @@ module load_store_queue (
     // cannot feed back through probe_addr -> probe_set_valid. That feedback was a
     // circular-combinational path (signal gs_i) that made ABC synthesis
     // explode from minutes to >20 min.
-    always_comb begin
-        logic gs_v_l;
-        logic [K:0] gs_key;
-        gs_v_l = 1'b0; gs_i = '0; gs_key = '1;
+    // Compare ages in parallel, then reduce the eligible older-entry masks.
+    // Late eligibility no longer passes through key-mux/comparator stages.
+    function automatic logic [LB:0] oldest_load(input logic [DQ-1:0] mask);
+        logic [DQ-1:0] oldest;
         for (int i = 0; i < DQ; i = i + 1) begin
-            if (l_valid[i] && (l_state[i] == LOAD_WAIT) && sl_any[i] && !blk_ov[i] &&
-                !f_fwd[i] && !ld_kill_mask[i] &&
-                (!gs_v_l || (l_key[i] < gs_key))) begin
-                gs_v_l = 1'b1; gs_i = i[LB-1:0]; gs_key = l_key[i];
-            end
+            oldest[i] = mask[i];
+            for (int j = 0; j < DQ; j = j + 1)
+                if (mask[j] && l_key[j] < l_key[i]) oldest[i] = 1'b0;
         end
-        gs_v = gs_v_l;
+        oldest_load = {|oldest, lowest_l(oldest)};
+    endfunction
+    logic [DQ-1:0] guard_mask;
+    always_comb begin
+        for (int i = 0; i < DQ; i = i + 1)
+            guard_mask[i]=l_valid[i] && (l_state[i]==LOAD_WAIT) &&
+                          sl_any[i] && !blk_ov[i] && !f_fwd[i];
     end
+    wire [LB:0] guard_pick=oldest_load(guard_mask);
+    always_comb begin gs_v=guard_pick[LB]; gs_i=guard_pick[LB-1:0]; end
     assign probe_addr = l_addr[gs_i];
 
     // relaxed GO: waive the same-line guard when the D$ probe says the line hits
@@ -411,25 +407,17 @@ module load_store_queue (
     logic [LB-1:0] nsel_i;
     wire [LB-1:0]  cur_i   = sc_v ? sc_i : nsel_i;
     wire        cur_v   = sc_v || nsel_v;
-    wire        cur_go  = cur_v && f_go_r[cur_i];
+    wire        cur_go  = cur_v && f_go_r[cur_i] && !flush_valid;
     wire        cur_fwd = cur_v && f_fwd[cur_i];
-    wire        cur_fwd_ok = cur_fwd && !ld_kill_mask[cur_i];
+    wire        cur_fwd_ok = cur_fwd;
 
+    logic [DQ-1:0] load_mask;
     always_comb begin
-        logic best_found;
-        logic [K:0] best_age;
-        logic [LB-1:0] best;
-        best_age = '1; best = '0; best_found = 1'b0;
-        for (int i = 0; i < DQ; i = i + 1) begin
-            if (l_valid[i] && (l_state[i] == LOAD_WAIT) && (f_go_r[i] || f_fwd[i]) &&
-                !ld_kill_mask[i]) begin
-                if (!best_found || (l_key[i] < best_age)) begin
-                    best_age = l_key[i]; best = i[LB-1:0]; best_found = 1'b1;
-                end
-            end
-        end
-        nsel_v = best_found; nsel_i = best;
+        for (int i = 0; i < DQ; i = i + 1)
+            load_mask[i]=l_valid[i] && (l_state[i]==LOAD_WAIT) && (f_go_r[i] || f_fwd[i]);
     end
+    wire [LB:0] load_pick=oldest_load(load_mask);
+    always_comb begin nsel_v=load_pick[LB]; nsel_i=load_pick[LB-1:0]; end
 
     always_comb begin
         ld_req = '0;
@@ -445,27 +433,12 @@ module load_store_queue (
     // ---------------- writeback selection ----------------
     logic [DQ-1:0] done_mask;
     wire [LB-1:0] dsel;
-    logic [K:0] dbest;
     always_comb begin
-        logic found;
-        done_mask = '0;
-        dbest = '1;
-        found = 1'b0;
-        for (int i = 0; i < DQ; i = i + 1) begin
-            if (l_valid[i] && (l_state[i] == LOAD_DONE)) begin
-                if (!found || (l_key[i] < dbest)) begin
-                    dbest = l_key[i];
-                    found = 1'b1;
-                end
-            end
-        end
-        if (found) begin
-            for (int i = 0; i < DQ; i = i + 1)
-                if (l_valid[i] && (l_state[i] == LOAD_DONE) && (l_key[i] == dbest))
-                    done_mask[i] = 1'b1;
-        end
+        for (int i = 0; i < DQ; i = i + 1)
+            done_mask[i]=l_valid[i] && (l_state[i]==LOAD_DONE);
     end
-    assign dsel = lowest_l(done_mask);
+    wire [LB:0] done_pick=oldest_load(done_mask);
+    assign dsel=done_pick[LB-1:0];
     wire have_done = (done_mask != '0);
     wire hold_take = have_done && (!wb_hold_valid || wb_grant) && !flush_valid;
 
@@ -599,35 +572,38 @@ module load_store_queue (
             end
 
             // ---- load scheduler ----
-            if (!sc_v) begin
-                if (nsel_v) begin
-                    if (f_fwd[nsel_i]) begin
-                        // forwarded this cycle: release immediately, no latch
-                        if (fwd_capture) l_valid[nsel_i] <= 1'b0;
-                        else begin sc_v <= 1'b1; sc_i <= nsel_i; end
-                    end else if (ld_ready) begin
-                        // the D$ accepted the combinationally presented request
-                        l_state[nsel_i] <= LOAD_SENT;
-                    end else begin
-                        sc_v <= 1'b1;
-                        sc_i <= nsel_i;
+            if (!flush_valid) begin
+                if (!sc_v) begin
+                    if (nsel_v) begin
+                        if (f_fwd[nsel_i]) begin
+                            // forwarded this cycle: release immediately, no latch
+                            if (fwd_capture) l_valid[nsel_i] <= 1'b0;
+                            else begin sc_v <= 1'b1; sc_i <= nsel_i; end
+                        end else if (ld_ready) begin
+                            // the D$ accepted the combinationally presented request
+                            l_state[nsel_i] <= LOAD_SENT;
+                        end else begin
+                            sc_v <= 1'b1;
+                            sc_i <= nsel_i;
+                        end
                     end
-                end
-            end else if (cur_fwd) begin
-                // Capture the forward in the WB hold and release its queue entry.
-                if (fwd_capture) begin
-                    l_valid[sc_i] <= 1'b0;
+                end else if (cur_fwd) begin
+                    // Capture the forward in the WB hold and release its queue entry.
+                    if (fwd_capture) begin
+                        l_valid[sc_i] <= 1'b0;
+                        sc_v <= 1'b0;
+                    end
+                end else if (ld_ready) begin
+                    l_state[sc_i] <= LOAD_SENT;
+                    sc_v <= 1'b0;
+                end else if (!f_go[sc_i] && !f_fwd[sc_i]) begin
+                    // The candidate's decision is NOT monotone: its forward source
+                    // (an older store) can retire+complete between the latch and
+                    // the completion, leaving the entry blocked, while a younger
+                    // entry may be GO. Release the latch and re-pick next cycle.
                     sc_v <= 1'b0;
                 end
-            end else if (ld_ready) begin
-                l_state[sc_i] <= LOAD_SENT;
-                sc_v <= 1'b0;
-            end else if (!f_go[sc_i] && !f_fwd[sc_i]) begin
-                // The candidate's decision is NOT monotone: its forward source
-                // (an older store) can retire+complete between the latch and
-                // the completion, leaving the entry blocked, while a younger
-                // entry may be GO. Release the latch and re-pick next cycle.
-                sc_v <= 1'b0;
+
             end
 
             // ---- responses ----

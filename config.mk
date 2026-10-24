@@ -13,10 +13,7 @@ APPIMAGE ?= $(FRAMEWORK_DIR)/cpu2026-tools-x86_64.AppImage
 # Without an AppImage, build uses Verilator on PATH (provided by OJ).
 # Explicit overrides always win; an invalid override fails instead of falling back.
 VERILATOR ?=
-# Netlist fidelity: expand Yosys' built-in `synth` and add -keepdc to
-# `opt -full`, which otherwise deletes the D$ and mis-slices its 10-bit set
-# index on this design. See docs/validation.md.
-YOSYS ?= $(FRAMEWORK_DIR)/tools/yosys_keepdc
+YOSYS ?=
 ABC ?=
 STA ?=
 ASAP7_LIB ?=

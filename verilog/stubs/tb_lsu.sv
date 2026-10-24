@@ -26,13 +26,13 @@ module tb_lsu;
     cpu_pkg::op_e in_op = cpu_pkg::OP_LOAD;
     logic [2:0]  in_funct3 = 3'd2;
     logic [31:0] in_base = 0, in_imm = 0, in_store_data = 0;
-    logic [5:0]  in_pdst = 0;
+    logic [$clog2(PRF_NUM)-1:0] in_pdst = 0;
     logic [$clog2(cpu_pkg::ROB_DEPTH)-1:0] in_rob = 0;
     wire         ld_alloc_ok, st_alloc_ok;
 
     // writeback / narrow completion
     wire        wb_valid;
-    wire [5:0]  wb_tag;
+    wire [$clog2(PRF_NUM)-1:0] wb_tag;
     wire [$clog2(cpu_pkg::ROB_DEPTH)-1:0] wb_rob;
     wire [31:0] wb_data;
     wire        ndone_valid;
@@ -275,7 +275,7 @@ module tb_lsu;
     logic        st_done [0:31];
     int          st_cyc_of [0:31];
     int          nd_cnt = 0;
-    logic [4:0]  nd_rob_last = 0;
+    logic [RB-1:0] nd_rob_last = 0;
 
     always_ff @(posedge clock) begin
         if (!reset) begin
@@ -309,24 +309,26 @@ module tb_lsu;
     endtask
 
     task automatic issue(input cpu_pkg::op_e op, input [31:0] base, input [2:0] f3,
-                         input [31:0] data, input [4:0] rob, input [5:0] pdst);
+                         input [31:0] data, input [RB-1:0] rob, input [$clog2(PRF_NUM)-1:0] pdst);
         while (!(op == cpu_pkg::OP_STORE ? st_alloc_ok : ld_alloc_ok)) @(negedge clock);
         in_valid = 1'b1; in_op = op; in_base = base; in_imm = 32'd0; in_funct3 = f3;
         in_store_data = data; in_rob = rob; in_pdst = pdst;
+        if (op == OP_LOAD) wb_seen[rob] = 1'b0;
+        else st_done[rob] = 1'b0;
         step(1);
         in_valid = 0;
         step(1);
     endtask
 
-    task automatic issue_load(input [31:0] addr, input [2:0] f3, input [4:0] rob, input [5:0] pdst);
+    task automatic issue_load(input [31:0] addr, input [2:0] f3, input [RB-1:0] rob, input [$clog2(PRF_NUM)-1:0] pdst);
         issue(cpu_pkg::OP_LOAD, addr, f3, 32'd0, rob, pdst);
     endtask
 
-    task automatic issue_store(input [31:0] addr, input [31:0] data, input [2:0] f3, input [4:0] rob);
+    task automatic issue_store(input [31:0] addr, input [31:0] data, input [2:0] f3, input [RB-1:0] rob);
         issue(cpu_pkg::OP_STORE, addr, f3, data, rob, 6'd0);
     endtask
 
-    task automatic retire(input [4:0] rob);
+    task automatic retire(input [RB-1:0] rob);
         cmt_valid = 2'b01; cmt_rob0 = rob;
         step(1);
         cmt_valid = 2'd0;
@@ -334,14 +336,14 @@ module tb_lsu;
         step(1);
     endtask
 
-    task automatic wait_wb(input [4:0] rob, input int timeout, output logic ok);
+    task automatic wait_wb(input [RB-1:0] rob, input int timeout, output logic ok);
         int t;
         ok = 1'b0; t = 0;
         while (!wb_seen[rob] && t < timeout) begin step(1); t = t + 1; end
         if (wb_seen[rob]) ok = 1'b1;
     endtask
 
-    task automatic wait_st_done(input [4:0] rob, input int timeout, output logic ok);
+    task automatic wait_st_done(input [RB-1:0] rob, input int timeout, output logic ok);
         int t;
         ok = 1'b0; t = 0;
         while (!st_done[rob] && t < timeout) begin step(1); t = t + 1; end
@@ -351,7 +353,7 @@ module tb_lsu;
     // ================= test sequence =================
     logic ok;
     int   wr_n;
-    logic [4:0] rb;
+    logic [RB-1:0] rb;
 
     initial begin
         for (int i = 0; i < 262144; i = i + 1) mem[i] = 32'd0;
@@ -390,56 +392,64 @@ module tb_lsu;
         issue_load(32'h0000_0044, 3'd2, 5'd2, 6'd1);
         wait_wb(5'd2, 50, ok);
         chk(ok, "T2 load wb");
-        chk(wb_data_of[2] == 32'h11223344, "T2 forwarded data");
-        chk(wb_cyc_of[2] < st_cyc_of[1] || !st_done[1], "T2 forwarded before store completion");
-        chk(!st_done[1], "T2 store still undrained (no retire)");
+        chk(wb_data_of[2 % ROB_DEPTH] == 32'h11223344, "T2 forwarded data");
+        chk(wb_cyc_of[2 % ROB_DEPTH] < st_cyc_of[1 % ROB_DEPTH] || !st_done[1 % ROB_DEPTH], "T2 forwarded before store completion");
+        chk(!st_done[1 % ROB_DEPTH], "T2 store still undrained (no retire)");
+        retire(RB'(1)); wait_st_done(RB'(1), 200, ok);
+        chk(ok, "T2 retire before ROB token reuse");
 
         // ---------------- T3: byte/half/word forwarding ----------------
         issue_store(32'h0000_0048, 32'h0000005A, 3'd0, 5'd3);            // sb 0x5A
         issue_load(32'h0000_0048, 3'd4, 5'd4, 6'd3);                     // lbu
         wait_wb(5'd4, 50, ok);
-        chk(ok && (wb_data_of[4] == 32'h0000005A), "T3 SB->LBU");
+        chk(ok && (wb_data_of[4 % ROB_DEPTH] == 32'h0000005A), "T3 SB->LBU");
+        retire(RB'(3)); wait_st_done(RB'(3), 200, ok);
+        chk(ok, "T3 byte store completion");
 
         issue_store(32'h0000_004A, 32'h0000BEEF, 3'd1, 5'd5);            // sh 0xBEEF
         issue_load(32'h0000_004A, 3'd5, 5'd6, 6'd4);                     // lhu
         wait_wb(5'd6, 50, ok);
-        chk(ok && (wb_data_of[6] == 32'h0000BEEF), "T3 SH->LHU");
+        chk(ok && (wb_data_of[6 % ROB_DEPTH] == 32'h0000BEEF), "T3 SH->LHU");
+        retire(RB'(5)); wait_st_done(RB'(5), 200, ok);
+        chk(ok, "T3 halfword store completion");
 
         issue_store(32'h0000_0050, 32'h44332211, 3'd2, 5'd7);            // sw
         issue_load(32'h0000_0051, 3'd0, 5'd8, 6'd5);                     // lb  -> 0x22
         wait_wb(5'd8, 50, ok);
-        chk(ok && (wb_data_of[8] == 32'h00000022), "T3 SW->LB byte1");
+        chk(ok && (wb_data_of[8 % ROB_DEPTH] == 32'h00000022), "T3 SW->LB byte1");
         issue_load(32'h0000_0053, 3'd0, 5'd9, 6'd6);                     // lb  -> 0x44
         wait_wb(5'd9, 50, ok);
-        chk(ok && (wb_data_of[9] == 32'h00000044), "T3 SW->LB byte3");
+        chk(ok && (wb_data_of[9 % ROB_DEPTH] == 32'h00000044), "T3 SW->LB byte3");
         issue_load(32'h0000_0052, 3'd4, 5'd10, 6'd7);                    // lbu -> 0x33
         wait_wb(5'd10, 50, ok);
-        chk(ok && (wb_data_of[10] == 32'h00000033), "T3 SW->LBU byte2");
+        chk(ok && (wb_data_of[10 % ROB_DEPTH] == 32'h00000033), "T3 SW->LBU byte2");
+        retire(RB'(7)); wait_st_done(RB'(7), 200, ok);
+        chk(ok, "T3 word store completion");
 
         // ---------------- T4: partial overlap blocks ----------------
         issue_store(32'h0000_0054, 32'h00000077, 3'd0, 5'd11);           // sb -> [0x54]
         issue_load(32'h0000_0054, 3'd2, 5'd12, 6'd8);                    // lw: partial overlap
         step(40);
-        chk(!wb_seen[12], "T4 load blocked while store live");
+        chk(!wb_seen[12 % ROB_DEPTH], "T4 load blocked while store live");
         retire(5'd11);
         wait_st_done(5'd11, 200, ok);
         chk(ok, "T4 store completion");
         wait_wb(5'd12, 300, ok);
         chk(ok, "T4 load completes after store");
-        chk(wb_data_of[12] == 32'hAABBCC77, "T4 merged data");
-        chk(wb_cyc_of[12] > st_cyc_of[11], "T4 load after store completion");
+        chk(wb_data_of[12 % ROB_DEPTH] == 32'hAABBCC77, "T4 merged data");
+        chk(wb_cyc_of[12 % ROB_DEPTH] > st_cyc_of[11 % ROB_DEPTH], "T4 load after store completion");
 
         // ---------------- T5: same-line guard ----------------
         issue_store(32'h0000_005C, 32'h55667788, 3'd2, 5'd13);
         issue_load(32'h0000_0058, 3'd2, 5'd14, 6'd9);                    // same line, no overlap
         step(40);
-        chk(!wb_seen[14], "T5 load blocked by same-line store");
+        chk(!wb_seen[14 % ROB_DEPTH], "T5 load blocked by same-line store");
         retire(5'd13);
         wait_st_done(5'd13, 200, ok);
         chk(ok, "T5 store completion");
         wait_wb(5'd14, 300, ok);
-        chk(ok && (wb_data_of[14] == 32'h00112233), "T5 load data after unblock");
-        chk(wb_cyc_of[14] > st_cyc_of[13], "T5 load after store completion");
+        chk(ok && (wb_data_of[14 % ROB_DEPTH] == 32'h00112233), "T5 load data after unblock");
+        chk(wb_cyc_of[14 % ROB_DEPTH] > st_cyc_of[13 % ROB_DEPTH], "T5 load after store completion");
 
         // ---------------- T6: flush kills an unretired store ----------------
         issue_store(32'h0000_0060, 32'h12345678, 3'd2, 5'd15);
@@ -483,13 +493,13 @@ module tb_lsu;
         end
         issue_load(32'h0000_0081, 3'd4, 5'd18, 6'd10);                   // lbu
         wait_wb(5'd18, 300, ok);
-        chk(ok && (wb_data_of[18] == 32'h0000005A), "T7 read-back LBU via memory");
+        chk(ok && (wb_data_of[18 % ROB_DEPTH] == 32'h0000005A), "T7 read-back LBU via memory");
         issue_load(32'h0000_0082, 3'd5, 5'd19, 6'd11);                   // lhu
         wait_wb(5'd19, 300, ok);
-        chk(ok && (wb_data_of[19] == 32'h0000BEEF), "T7 read-back LHU via memory");
+        chk(ok && (wb_data_of[19 % ROB_DEPTH] == 32'h0000BEEF), "T7 read-back LHU via memory");
         issue_load(32'h0000_0080, 3'd2, 5'd20, 6'd12);                   // lw
         wait_wb(5'd20, 300, ok);
-        chk(ok && (wb_data_of[20] == 32'hBEEF5A00), "T7 read-back LW");
+        chk(ok && (wb_data_of[20 % ROB_DEPTH] == 32'hBEEF5A00), "T7 read-back LW");
 
         // eviction pressure: touch 300 distinct lines (stride 0x10)
         rb = 5'd20;
@@ -509,26 +519,25 @@ module tb_lsu;
         // ---------------- T8: MSHR concurrency + same-set replay ----------
         // 0x20000 and 0x30000 share D$ set 0; 0x20100 is a different set.
         rb = rb + 5'd1;
-        wb_seen[rb] = 1'b0; wb_seen[rb + 5'd1] = 1'b0; wb_seen[rb + 5'd2] = 1'b0;
+        wb_seen[rb] = 1'b0; wb_seen[RB'(rb + 1)] = 1'b0; wb_seen[RB'(rb + 2)] = 1'b0;
         issue_load(32'h0002_0000, 3'd2, rb, 6'd22);
         issue_load(32'h0003_0000, 3'd2, rb + 5'd1, 6'd23);               // same set -> replay
         issue_load(32'h0002_0100, 3'd2, rb + 5'd2, 6'd24);               // other set
         wait_wb(rb, 600, ok);
         chk(ok && (wb_data_of[rb] == 32'hAAAA0000), "T8 miss A");
         wait_wb(rb + 5'd1, 600, ok);
-        chk(ok && (wb_data_of[rb + 5'd1] == 32'hCCCC2222), "T8 same-set replay load");
+        chk(ok && (wb_data_of[RB'(rb + 1)] == 32'hCCCC2222), "T8 same-set replay load");
         wait_wb(rb + 5'd2, 600, ok);
-        chk(ok && (wb_data_of[rb + 5'd2] == 32'hBBBB1111), "T8 concurrent other-set load");
+        chk(ok && (wb_data_of[RB'(rb + 2)] == 32'hBBBB1111), "T8 concurrent other-set load");
 
         // ---------------- report ----------------
         if (errors == 0) $display("[tb_lsu] ALL OK");
-        else             $display("[tb_lsu] FAILED: %0d error(s)", errors);
+        else             $fatal(1, "[tb_lsu] FAILED: %0d error(s)", errors);
         $finish;
     end
 
     initial begin
         #5_000_000;
-        $display("[tb_lsu] FAIL: global timeout");
-        $finish;
+        $fatal(1, "[tb_lsu] global timeout");
     end
 endmodule

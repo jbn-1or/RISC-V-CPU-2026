@@ -31,6 +31,25 @@ module student_top (
     input  wire        bvalid,
     output wire        bready
 );
+`ifndef SYNTHESIS
+    initial begin
+        if (cpu_pkg::ISSUE_WIDTH < 1 || cpu_pkg::ISSUE_WIDTH > 2 ||
+            cpu_pkg::DECODE_WIDTH < 1 || cpu_pkg::DECODE_WIDTH > 2)
+            $fatal(1, "widths must be 1 or 2");
+        if ((cpu_pkg::ASSOC != 1 && cpu_pkg::ASSOC != 2) ||
+            cpu_pkg::IC_LINES < 4 || cpu_pkg::DC_LINES < 8 ||
+            (cpu_pkg::IC_LINES & (cpu_pkg::IC_LINES - 1)) != 0 ||
+            (cpu_pkg::DC_LINES & (cpu_pkg::DC_LINES - 1)) != 0)
+            $fatal(1, "caches require ASSOC=1/2, power-of-two IC_LINES>=4 and DC_LINES>=8");
+        if (cpu_pkg::IQ_DEPTH < 2 ||
+            (cpu_pkg::IQ_DEPTH & (cpu_pkg::IQ_DEPTH - 1)) != 0 ||
+            cpu_pkg::ROB_DEPTH < 4 ||
+            (cpu_pkg::ROB_DEPTH & (cpu_pkg::ROB_DEPTH - 1)) != 0 ||
+            cpu_pkg::PRF_NUM < 64 ||
+            (cpu_pkg::PRF_NUM & (cpu_pkg::PRF_NUM - 1)) != 0)
+            $fatal(1, "IQ/ROB/PRF capacities must be supported powers of two");
+    end
+`endif
     // ---------------- frontend decode interface ----------------
     wire [63:0] fu_dec_pc, fu_dec_raw;
     wire [1:0]  fu_dec_valid;
@@ -56,11 +75,19 @@ module student_top (
     // the registered `flush`), so the PC restarts at the correct target one
     // cycle earlier while the ROB/IQ/LSU kill protocol is unchanged.
     cpu_pkg::flush_t fe_flush;
+    logic [31:0] redirect_next_q;
+    always_ff @(posedge clock) begin
+        if (reset) redirect_next_q <= '0;
+        else redirect_next_q <= co_redir_next_pc;
+    end
+    wire [31:0] fe_next_pc = (cpu_pkg::EARLY_REDIRECT != 0) ? co_redir_next_pc : redirect_next_q;
     always_comb begin
         fe_flush       = flush;
-        fe_flush.valid = co_redir_valid;
-        fe_flush.pc    = co_redir_pc;
-        fe_flush.bsf   = co_redir_bsf;
+        if (cpu_pkg::EARLY_REDIRECT != 0) begin
+            fe_flush.valid = co_redir_valid;
+            fe_flush.pc    = co_redir_pc;
+            fe_flush.bsf   = co_redir_bsf;
+        end
     end
 
     decode u_dec (
@@ -76,7 +103,7 @@ module student_top (
     wire [31:0] fu_rsp_data;
 
     fetch_unit u_fe (
-        .clock, .reset, .flush(fe_flush), .flush_next_pc(co_redir_next_pc),
+        .clock, .reset, .flush(fe_flush), .flush_next_pc(fe_next_pc),
         .dec_pc_s(fu_dec_pc), .dec_raw_s(fu_dec_raw), .dec_valid_s(fu_dec_valid),
         .dec_out_valid(dec_ov), .dec_d0(dec_d0), .dec_d1(dec_d1),
         .fe_valid, .fe0, .fe1, .fe_take,

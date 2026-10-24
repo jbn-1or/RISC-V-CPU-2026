@@ -65,8 +65,12 @@ module iq (
     logic [2:0]   fu_q  [0:D-1];
     logic         pt_q  [0:D-1];
     logic [31:0]  ptg_q [0:D-1];
-    cpu_pkg::decoded_t insn_q [0:D-1];
+    logic [$bits(d0.insn)-1:0] insn_q [0:D-1];
     logic [SB-1:0] rot_q;
+    wire [RB-1:0] age [0:D-1];
+    generate for (genvar a = 0; a < D; a = a+1) begin : g_age
+        assign age[a] = RB'(rob_q[a]-rob_head);
+    end endgenerate
 
     // ---------------- free-slot allocation ----------------
     function automatic logic [SB-1:0] lowest(input logic [D-1:0] f);
@@ -120,115 +124,79 @@ module iq (
     // store address is already known to the LSQ when a load enters it, and the
     // forwarding/blocking checks see all potential dependencies.
     // Younger stores cannot change memory before that load executes, since
-    // stores drain only after in-order retirement. Flush-killed IQ entries are
-    // excluded from both this age search and the issue selectors.
+    // stores drain only after in-order retirement. Issue pauses on recovery;
+    // the sequential kill clears younger entries before issue resumes.
     logic [D-1:0] lsu_v, lsu_st_v, lsu_elig, lsu_sel;
     // Frequency-first: issue selection must not depend on the combinational
     // flush kill mask.  On a flush cycle the whole issue port is suppressed
     // for one cycle (issue_en), which is enough to keep LSU allocations out of
     // the flush window; older entries simply issue after the flush cycle.
     wire          issue_en = !flush_valid;
+    logic [D-1:0] lsu_ready;
     always_comb begin
-        logic found;
-        logic [RB-1:0] best;
-        logic [SB-1:0] bi;
-        logic f2;
-        logic [RB-1:0] b2;
-        logic [SB-1:0] i2;
-        lsu_v = '0; lsu_st_v = '0; lsu_elig = '0; lsu_sel = '0;
-        found = 1'b0; best = '0; bi = '0;
         for (int i = 0; i < D; i = i + 1) begin
-            lsu_v[i]    = v_q[i] && (fu_q[i] == cpu_pkg::FU_LSU);
+            lsu_v[i] = v_q[i] && (fu_q[i] == cpu_pkg::FU_LSU);
             lsu_st_v[i] = lsu_v[i] && st_ent_q[i];
-            if (lsu_st_v[i] && (!found || ((rob_q[i] - rob_head) < best))) begin
-                best = rob_q[i] - rob_head;
-                bi   = i[SB-1:0];
-                found = 1'b1;
-            end
         end
         for (int i = 0; i < D; i = i + 1) begin
-            if (st_ent_q[i])
-                // store: only the head of the pending stores may issue
-                lsu_elig[i] = lsu_v[i] && found && (i[SB-1:0] == bi);
-            else
-                // load: only if it precedes the oldest pending store (or none)
-                lsu_elig[i] = lsu_v[i] &&
-                              (!found || ((rob_q[i] - rob_head) < best));
+            lsu_elig[i] = lsu_v[i];
+            for (int j = 0; j < D; j = j + 1)
+                if (lsu_st_v[j] && (age[j] < age[i]))
+                    lsu_elig[i] = 1'b0;
+            lsu_ready[i] = lsu_elig[i] &&
+                (r1_q[i] || ((cpu_pkg::WB_BYPASS != 0) && r1_set[i])) &&
+                (st_ent_q[i] || r2_q[i] || ((cpu_pkg::WB_BYPASS != 0) && r2_set[i])) &&
+                (st_ent_q[i] ? lsu_free_st : lsu_free_ld);
         end
-        f2 = 1'b0; b2 = '0; i2 = '0;
         for (int i = 0; i < D; i = i + 1) begin
-            logic rdy;
-            // A store needs only its address operand (rs1) to
-            // issue; its data (rs2) is filled into the STQ later via the
-            // writeback-bus CAM. A load still needs both operands ready.
-            rdy = (r1_q[i] || ((cpu_pkg::WB_BYPASS != 0) && r1_set[i])) &&
-                  (st_ent_q[i] || (r2_q[i] || ((cpu_pkg::WB_BYPASS != 0) && r2_set[i])));
-            if (lsu_elig[i] && rdy && (st_ent_q[i] ? lsu_free_st : lsu_free_ld)) begin
-                if (!f2 || ((rob_q[i] - rob_head) < b2)) begin
-                    b2 = rob_q[i] - rob_head;
-                    i2 = i[SB-1:0];
-                    f2 = 1'b1;
-                end
-            end
+            lsu_sel[i] = lsu_ready[i];
+            for (int j = 0; j < D; j = j + 1)
+                if (lsu_ready[j] && (age[j] < age[i]))
+                    lsu_sel[i] = 1'b0;
         end
-        if (f2) lsu_sel[i2] = 1'b1;
     end
 
-    // ---------------- issue selection ----------------
+    // Two parallel eligibility masks preserve the rotating priority policy.
+    // No variable-index serial resource scan is needed to select two slots.
+    function automatic logic [SB-1:0] rotated_first(input logic [D-1:0] mask);
+        logic [D-1:0] suffix;
+        for (int i = 0; i < D; i = i + 1) suffix[i] = mask[i] && (i[SB-1:0] >= rot_q);
+        rotated_first = lowest((|suffix) ? suffix : mask);
+    endfunction
+    function automatic logic [2:0] select_port(input logic [2:0] fu, input logic second_alu);
+        case (fu)
+            cpu_pkg::FU_ALU: select_port = (alu0_free && !second_alu) ? cpu_pkg::IUP_ALU0 : cpu_pkg::IUP_ALU1;
+            cpu_pkg::FU_BR: select_port = cpu_pkg::IUP_BRU;
+            cpu_pkg::FU_MUL: select_port = cpu_pkg::IUP_MUL;
+            cpu_pkg::FU_DIV: select_port = cpu_pkg::IUP_DIV;
+            default: select_port = cpu_pkg::IUP_LSU;
+        endcase
+    endfunction
+    logic [D-1:0] ready0, ready1;
     always_comb begin
-        logic a0, a1, bru, mul, div, lsu_ld, lsu_st;
-        logic [SB-1:0] i;
-        logic ok;
-        cpu_pkg::iup_e port;
-        s0v = 1'b0; s1v = 1'b0; s0 = '0; s1 = '0;
-        port0 = cpu_pkg::IUP_ALU0; port1 = cpu_pkg::IUP_ALU0;        a0 = alu0_free; a1 = alu1_free;
-        bru = bru_free; mul = mul_free; div = div_free;
-        lsu_ld = lsu_free_ld; lsu_st = lsu_free_st;
-        for (int n = 0; n < D; n = n + 1) begin
-            i = rot_q + n[SB-1:0];
-            // WB bypass: an operand wired to this cycle's qualified writeback is
-            // usable immediately (the value is taken from the bus in core_ooo).
-            // Stores issue on address (rs1) readiness alone.
-            ok = v_q[i] && issue_en &&
-                 (r1_q[i] || ((cpu_pkg::WB_BYPASS != 0) && r1_set[i])) &&
-                 (st_ent_q[i] || r2_q[i] || ((cpu_pkg::WB_BYPASS != 0) && r2_set[i]));
-            port = cpu_pkg::IUP_ALU0;
-            if (ok) begin
-                case (fu_q[i])
-                    cpu_pkg::FU_ALU: begin
-                        if (a0) begin port = cpu_pkg::IUP_ALU0; a0 = 1'b0; end
-                        else if (a1) begin port = cpu_pkg::IUP_ALU1; a1 = 1'b0; end
-                        else ok = 1'b0;
-                    end
-                    cpu_pkg::FU_BR: begin
-                        if (bru) bru = 1'b0; else ok = 1'b0;
-                        port = cpu_pkg::IUP_BRU;
-                    end
-                    cpu_pkg::FU_MUL: begin
-                        if (mul) mul = 1'b0; else ok = 1'b0;
-                        port = cpu_pkg::IUP_MUL;
-                    end
-                    cpu_pkg::FU_DIV: begin
-                        if (div) div = 1'b0; else ok = 1'b0;
-                        port = cpu_pkg::IUP_DIV;
-                    end
-                    cpu_pkg::FU_LSU: begin
-                        // relaxed in-order gate (see lsu_elig above): oldest
-                        // pending store, or a load older than it; readiness is
-                        // per op kind (registered bit, no comb loop, no indexed
-                        // struct-field access for Yosys)
-                        if ((st_ent_q[i] ? lsu_st : lsu_ld) &&
-                            lsu_sel[i]) begin
-                            lsu_ld = 1'b0; lsu_st = 1'b0;
-                        end else ok = 1'b0;
-                        port = cpu_pkg::IUP_LSU;
-                    end
-                    default: ok = 1'b0;
-                endcase
-            end
-            if (ok && !s0v) begin s0v = 1'b1; s0 = i; port0 = port; end
-            else if (ok && !s1v) begin s1v = 1'b1; s1 = i; port1 = port; end
+        for (int i = 0; i < D; i = i + 1) begin
+            ready0[i] = v_q[i] && issue_en &&
+                (r1_q[i] || ((cpu_pkg::WB_BYPASS != 0) && r1_set[i])) &&
+                (st_ent_q[i] || r2_q[i] || ((cpu_pkg::WB_BYPASS != 0) && r2_set[i]));
+            case (fu_q[i])
+                cpu_pkg::FU_ALU: ready0[i] = ready0[i] && (alu0_free || alu1_free);
+                cpu_pkg::FU_BR: ready0[i] = ready0[i] && bru_free;
+                cpu_pkg::FU_MUL: ready0[i] = ready0[i] && mul_free;
+                cpu_pkg::FU_DIV: ready0[i] = ready0[i] && div_free;
+                cpu_pkg::FU_LSU: ready0[i] = ready0[i] && lsu_sel[i];
+                default: ready0[i] = 1'b0;
+            endcase
         end
+        s0v = |ready0;
+        s0 = rotated_first(ready0);
+        for (int i = 0; i < D; i = i + 1)
+            ready1[i] = ready0[i] && (i[SB-1:0] != s0) &&
+                ((fu_q[i] != fu_q[s0]) ||
+                 ((fu_q[i] == cpu_pkg::FU_ALU) && alu0_free && alu1_free));
+        s1v = (cpu_pkg::ISSUE_WIDTH == 2) && (|ready1);
+        s1 = rotated_first(ready1);
+        port0 = select_port(fu_q[s0], 1'b0);
+        port1 = select_port(fu_q[s1], fu_q[s0] == cpu_pkg::FU_ALU && fu_q[s1] == cpu_pkg::FU_ALU);
     end
     assign iss_valid = {s1v, s0v};
     assign iss0_v = s0v;  assign iss0_rob = rob_q[s0];
@@ -245,7 +213,9 @@ module iq (
         iss0.pred_taken  = pt_q[s0];
         iss0.pred_target = ptg_q[s0];
         iss0.bix         = bix_q[s0];
-        iss0.rs2_ready   = r2_q[s0] || ((cpu_pkg::WB_BYPASS != 0) && r2_set[s0]);
+        // Store-data forwarding is independent of ALU wake/execute bypass:
+        // a new STQ entry cannot wait for a writeback already passing now.
+        iss0.rs2_ready   = r2_q[s0] || r2_set[s0];
 
         iss1 = '0;
         iss1.insn        = insn_q[s1];
@@ -257,7 +227,7 @@ module iq (
         iss1.pred_taken  = pt_q[s1];
         iss1.pred_target = ptg_q[s1];
         iss1.bix         = bix_q[s1];
-        iss1.rs2_ready   = r2_q[s1] || ((cpu_pkg::WB_BYPASS != 0) && r2_set[s1]);
+        iss1.rs2_ready   = r2_q[s1] || r2_set[s1];
     end
 
     // dispatch wakeup bypass

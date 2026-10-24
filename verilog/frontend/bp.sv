@@ -106,8 +106,10 @@ module bp (
                                                       : ghr_after0;
     // GHR value the mispredicting branch saw at fetch (reconstructed from its
     // carried gshare index), advanced by its actual outcome
+    // Use one PC slice. Native Yosys misinterprets the chained packed slice
+    // up_pc[BHI+1:2][GH-1:0] as up_pc[GH-1:0], unlike RTL simulation.
     wire [GHRW-1:0] ghr_rst = { {(GHRW-GH){1'b0}},
-                                 (up_ix[GH-1:0] ^ up_pc[BHI+1:2][GH-1:0]) };
+                                 (up_ix[GH-1:0] ^ up_pc[GH+1:2]) };
 
     logic [1:0] bht_b [0:BHTN-1];     // bimodal (pc-indexed)
     logic [1:0] bht_g [0:BHTN-1];     // gshare (pc^ghr)

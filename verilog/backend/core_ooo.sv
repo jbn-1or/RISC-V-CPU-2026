@@ -418,7 +418,15 @@ module core_ooo (
     wire l_i  = l_i0 || l_i1;
     wire cpu_pkg::issue_t l_iss = l_i0 ? iss0 : iss1;
     wire [31:0] l_base = l_i0 ? opa0 : opa1;
-    wire [31:0] l_data = l_i0 ? opb0 : opb1;
+    // Stores can issue before rs2 is ready. IQ's rs2_ready also reports a
+    // same-cycle writeback hit, including when ALU wake/execute bypass is
+    // disabled. Forward that data independently: reading the old PRF value
+    // here would mark a newly allocated STQ entry ready with stale data.
+    wire [31:0] store_data0 = (ba_ok.valid && iss0.ps2 != '0 && iss0.ps2 == ba_ok.prf_tag) ? ba_ok.result :
+                              (bb_ok.valid && iss0.ps2 != '0 && iss0.ps2 == bb_ok.prf_tag) ? bb_ok.result : prf_r1;
+    wire [31:0] store_data1 = (ba_ok.valid && iss1.ps2 != '0 && iss1.ps2 == ba_ok.prf_tag) ? ba_ok.result :
+                              (bb_ok.valid && iss1.ps2 != '0 && iss1.ps2 == bb_ok.prf_tag) ? bb_ok.result : prf_r3;
+    wire [31:0] l_data = l_i0 ? store_data0 : store_data1;
 
     wire        lsu_ld_ok, lsu_st_ok, lsu_wb_valid, lsu_ndone_valid;
     wire [PB_C-1:0] lsu_wb_tag;
