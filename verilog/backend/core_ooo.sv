@@ -23,7 +23,6 @@ module core_ooo (
     output logic        redir_valid,
     output logic [31:0] redir_pc,
     output wire [31:0] redir_next_pc,
-    output logic [5:0]  redir_bsf,
 
     // ---- branch resolution feedback (BHT training) ----
     output logic        br_upd_valid,
@@ -50,7 +49,7 @@ module core_ooo (
 
     // ---- D$ set-valid probe for the same-line guard relaxation ----
     output wire [31:0] probe_addr,
-    input  wire        probe_set_valid,
+    input  wire        probe_set_valid
 );
     localparam int PB_C = $clog2(cpu_pkg::PRF_NUM);   // physical tag bits
     localparam int RB_C = $clog2(cpu_pkg::ROB_DEPTH); // rob index bits
@@ -78,6 +77,8 @@ module core_ooo (
     always_comb begin
         bb_other = mul_skid_out.valid ? mul_skid_out : a1_h;
         bb_other.valid = mul_skid_out.valid || a1_hv;
+    end
+    always_comb begin
         ba_sched = ba;
         ba_sched.valid = ba.valid && sched_a_match;
         bb_sched = bb;
@@ -282,7 +283,6 @@ module core_ooo (
     wire [31:0] b_b = b_i0 ? opb0 : opb1;
     wire [PB_C-1:0] b_pdst = b_i0 ? iss0.pdst : iss1.pdst;
     wire [RB_C-1:0] b_rob  = b_i0 ? iss0.rob  : iss1.rob;
-    wire [5:0]  b_bsf  = b_i0 ? iss0.bsf  : iss1.bsf;
     wire        b_pt   = b_i0 ? iss0.pred_taken  : iss1.pred_taken;
     wire [31:0] b_ptg  = b_i0 ? iss0.pred_target : iss1.pred_target;
     wire [31:0] b_link, b_tgt;
@@ -316,7 +316,6 @@ module core_ooo (
             flush_r.valid <= 1'b1;
             flush_r.pc    <= b_taken ? b_tgt : (b_insn.pc + 32'd4);
             flush_r.rob   <= b_rob;
-            flush_r.bsf   <= b_bsf;
         end else begin
             flush_r.valid <= 1'b0;
         end
@@ -326,7 +325,6 @@ module core_ooo (
     // registered flush_r above broadcasts the kill one cycle later).
     assign redir_valid = b_i && b_mispred;
     assign redir_pc    = b_taken ? b_tgt : (b_insn.pc + 32'd4);
-    assign redir_bsf   = b_bsf;
     // Precompute the block following each redirect alternative before the
     // data-dependent taken decision. Align(x)+8 == Align(x+8).
     wire [31:0] b_target_next = (b_insn.op == cpu_pkg::OP_JALR) ?
@@ -390,11 +388,7 @@ module core_ooo (
     wire [31:0] div_wb_data;
     div u_div (.clock, .reset,
         .req_valid(d_i), .req_a(d_a), .req_b(d_b),
-        // Fused DIV/REM pair support is kept in the unit;
-        // the core currently sends each instruction separately (req_fused=0).
-        .req_f3a(d_insn.funct3), .req_f3b(3'b0), .req_fused(1'b0),
-        .req_tag_a(d_pdst), .req_rob_a(d_rob),
-        .req_tag_b('0), .req_rob_b('0),
+        .req_funct3(d_insn.funct3), .req_tag(d_pdst), .req_rob(d_rob),
         .req_ready(div_req_ready),
         .wb_valid(div_wb_valid), .wb_tag(div_wb_tag), .wb_rob(div_wb_rob),
         .wb_data(div_wb_data));
@@ -406,8 +400,7 @@ module core_ooo (
         .in({div_wb_valid, div_wb_tag, div_wb_rob, div_wb_data}),
         .in_ready(div_skid_in_ready), .out(div_skid_out), .out_accept(div_skid_accept),
         .level(div_skid_level));
-    // One DIV op emits at most two beats and the unit is single-op, so keeping
-    // two slots free guarantees its beats are accepted.
+    // Keep the existing two-slot reserve so request timing stays unchanged.
     assign div_free = div_req_ready && ({1'b0, div_skid_level} <= 3'd2) &&
                       div_skid_in_ready;
 

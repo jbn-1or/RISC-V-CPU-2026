@@ -21,11 +21,11 @@ sh verilog/stubs/run_ut.sh tb_lsu
 | `tb_stub_link` | decode 与连接桩的接口冒烟测试 |
 | `tb_bp` | BHT、BTB、RAS、预测索引，以及条件/间接分支误预测后的 GHR 恢复 |
 | `tb_mul` / `tb_div` | 乘除法执行单元 |
-| `tb_issue_width` | 单/双发射改变实际 grant 上限，年轻就绪指令越过较老等待指令 |
+| `tb_issue_width` | 单/双发射上限、年轻就绪指令越过等待指令、ROB 回绕时 LSU 优先级 |
 | `tb_store_wakeup` | store 入队与写回同拍，关闭 ALU 旁路时仍捕获数据就绪状态 |
 | `tb_cache_assoc` | 冲突地址命中计数、两路替换、字节更新、失效 |
 | `tb_rob_recovery` | 每个 flush 点的最老写者恢复，覆盖满 ROB 和回绕窗口 |
-| `tb_ifb_recovery` | 分支恢复清空 IFB；部分/满/回绕队列及 ROB64 大年龄跨度 |
+| `tb_ifb_recovery` | 分支恢复清空 IFB；全部占用数和 head 位置，覆盖部分/满/回绕队列 |
 
 通过 `--filelist <配置快照>/filelist.f --out <独立目录>` 可运行参数变体，避免覆盖默认构建。LSU 测试会在 ROB 号复用前退休和排空旧 store，断言失败以非零状态退出。
 

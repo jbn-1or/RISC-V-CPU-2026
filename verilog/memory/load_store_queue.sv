@@ -72,7 +72,7 @@ module load_store_queue (
 
     // ---- D$ set-valid probe for the same-line guard relaxation ----
     output wire [31:0] probe_addr,
-    input  wire        probe_set_valid,
+    input  wire        probe_set_valid
 );
     localparam int DQ = cpu_pkg::LDQ_DEPTH;   // load queue depth
     localparam int SQ = cpu_pkg::STQ_DEPTH;   // store queue depth
@@ -130,15 +130,13 @@ module load_store_queue (
 
     // ---------------- load queue ----------------
     logic [DQ-1:0] l_valid;
-    localparam logic [1:0] LOAD_WAIT = 2'd0; // waiting for forwarding/cache
-    localparam logic [1:0] LOAD_SENT = 2'd1; // awaiting cache response/replay
-    localparam logic [1:0] LOAD_DONE = 2'd2; // buffered response, awaiting WB hold
-    logic [1:0] l_state [0:DQ-1];
+    localparam logic LOAD_WAIT = 1'b0; // waiting for forwarding/cache
+    localparam logic LOAD_SENT = 1'b1; // awaiting cache response/replay
+    logic l_state [0:DQ-1];
     logic [31:0] l_addr [0:DQ-1];
     logic [2:0]  l_f3   [0:DQ-1];
     logic [RB-1:0] l_rob  [0:DQ-1];
     logic [$clog2(cpu_pkg::PRF_NUM)-1:0] l_pdst [0:DQ-1];
-    logic [31:0] l_data [0:DQ-1];
 
     // ---------------- store queue ----------------
     logic [SQ-1:0] s_valid, s_ret, s_drd;
@@ -430,18 +428,6 @@ module load_store_queue (
     end
     assign ld_valid = cur_go;
 
-    // ---------------- writeback selection ----------------
-    logic [DQ-1:0] done_mask;
-    wire [LB-1:0] dsel;
-    always_comb begin
-        for (int i = 0; i < DQ; i = i + 1)
-            done_mask[i]=l_valid[i] && (l_state[i]==LOAD_DONE);
-    end
-    wire [LB:0] done_pick=oldest_load(done_mask);
-    assign dsel=done_pick[LB-1:0];
-    wire have_done = (done_mask != '0);
-    wire hold_take = have_done && (!wb_hold_valid || wb_grant) && !flush_valid;
-
     // ---------------- cache-response writeback ----------------
     // Match the outstanding entry by ROB number. ROB qualification rejects
     // killed results; cache-side kills prevent responses to reused ROB slots.
@@ -482,12 +468,6 @@ module load_store_queue (
                 wb_hold_rob <= l_rob[cur_i];
                 wb_hold_data <= f_data[cur_i];
                 l_valid[cur_i] <= 1'b0;
-            end else if (hold_take) begin
-                wb_hold_valid     <= 1'b1;
-                wb_hold_tag  <= l_pdst[dsel];
-                wb_hold_rob  <= l_rob[dsel];
-                wb_hold_data <= l_data[dsel];
-                l_valid[dsel] <= 1'b0;
             end else if (wb_grant) begin
                 wb_hold_valid <= 1'b0;
             end
@@ -619,14 +599,7 @@ module load_store_queue (
                 end else if (load_response_match) begin
                     // The response is presented on BB this cycle; release
                     // the outstanding entry now (exactly once).
-                    if (l_valid[response_load_slot] && (l_state[response_load_slot] == LOAD_SENT) && (l_rob[response_load_slot] == resp.rob))
-                        l_valid[response_load_slot] <= 1'b0;
-                end else begin
-                    for (int i = 0; i < DQ; i = i + 1)
-                        if (l_valid[i] && (l_state[i] == LOAD_SENT) && (l_rob[i] == resp.rob)) begin
-                            l_state[i]   <= LOAD_DONE;
-                            l_data[i] <= ldext(resp.rdata, l_f3[i], l_addr[i][1:0]);
-                        end
+                    l_valid[response_load_slot] <= 1'b0;
                 end
             end
 

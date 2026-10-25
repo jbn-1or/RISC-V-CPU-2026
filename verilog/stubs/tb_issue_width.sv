@@ -5,6 +5,7 @@ module tb_issue_width;
     logic clock = 0, reset = 1;
     always #5 clock = ~clock;
     logic [1:0] disp_valid = 0;
+    logic [RB-1:0] rob_head = '0;
     renamed_t d0, d1;
     writeback_t wb_a, wb_b;
     wire [1:0] iss_valid;
@@ -12,7 +13,7 @@ module tb_issue_width;
     int total = 0, peak = 0;
     iq dut (
         .clock, .reset, .disp_valid, .d0, .d1, .space(), .wb_a, .wb_b,
-        .rob_head(RB'(0)), .flush_valid(1'b0), .flush_rob(RB'(0)), .flush_dtail((RB+1)'(0)),
+        .rob_head, .flush_valid(1'b0), .flush_rob(RB'(0)), .flush_dtail((RB+1)'(0)),
         .alu0_free(1'b1), .alu1_free(1'b1), .bru_free(1'b1),
         .mul_free(1'b1), .div_free(1'b1), .lsu_free_ld(1'b1), .lsu_free_st(1'b1),
         .iss_valid, .iss0, .iss1, .port0(), .port1(),
@@ -55,6 +56,31 @@ module tb_issue_width;
         @(negedge clock); wb_a = '0;
         repeat (3) @(negedge clock);
         if (total != 4) $fatal(1, "out-of-order wakeup lost or duplicated a grant");
+        // Memory selection must follow ROB ring order even when the rotating
+        // slot priority prefers the younger load. Exercise every head, with
+        // both tags before/after head and with a pair crossing physical wrap.
+        for (int head = 0; head < ROB_DEPTH; head++) begin
+            int distance;
+            reset = 1;
+            @(negedge clock);
+            reset = 0; rob_head = RB'(head);
+            distance = head % (ROB_DEPTH-1);
+            d0 = '0; d0.insn.op = OP_LOAD; d0.insn.fu = FU_LSU;
+            d0.rs1_ready = 1; d0.rs2_ready = 1;
+            d0.rob = RB'(head+distance);
+            d1 = d0; d1.rob = RB'(head+distance+1);
+            disp_valid = 3;
+            @(negedge clock); disp_valid = 0;
+            dut.rot_q = $clog2(IQ_DEPTH)'(1);
+            #1;
+            if (iss_valid != 1 || iss0.rob != d0.rob)
+                $fatal(1, "LSU oldest selection failed: head=%0d older=%0d younger=%0d", head, d0.rob, d1.rob);
+            @(negedge clock);
+            #1;
+            if (iss_valid != 1 || iss0.rob != d1.rob)
+                $fatal(1, "LSU lost younger load after oldest grant");
+            @(negedge clock);
+        end
         $display("PASS: ISSUE_WIDTH=%0d, peak=%0d, total=%0d", ISSUE_WIDTH, peak, total);
         $finish;
     end

@@ -1,6 +1,6 @@
 // Single-instruction RV32IM decoder.
-// Pure combinational; fills cpu_pkg::decoded_t. Illegal/omitted encodings,
-// CSR/FENCE/ECALL/EBREAK map to OP_NOP with illegal=1 (no side effects).
+// Combinational decode. The course omits CSR/FENCE/ECALL/EBREAK;
+// unsupported opcodes produce OP_NOP. No exception interface is implemented.
 module decode1 (
     input  wire [31:0] in_pc,
     input  wire [31:0] in_raw,
@@ -36,8 +36,7 @@ module decode1 (
         t.rd = rd; t.rs1 = rs1; t.rs2 = rs2;
         t.funct3 = f3; t.funct7 = f7;
         t.uses_rs1 = 1'b0; t.uses_rs2 = 1'b0; t.uses_imm = 1'b0;
-        t.is_branch = 1'b0; t.is_ret = 1'b0; t.is_exit = 1'b0; t.is_fuse = 1'b0;
-        t.illegal = 1'b0;
+        t.is_ret = 1'b0;
         case (opcode)
             7'h37: begin // LUI
                 t.op = cpu_pkg::OP_LUI;   t.fu = cpu_pkg::FU_ALU; t.imm = imm_u; t.uses_imm = 1'b1; end
@@ -47,11 +46,11 @@ module decode1 (
                 t.op = cpu_pkg::OP_JAL;   t.fu = cpu_pkg::FU_ALU; t.imm = imm_j; end
             7'h67: begin // JALR
                 t.op = cpu_pkg::OP_JALR;  t.fu = cpu_pkg::FU_BR;  t.imm = imm_i;
-                t.is_branch = 1'b1; t.uses_rs1 = (rs1 != cpu_pkg::ZERO_REG);
+                t.uses_rs1 = (rs1 != cpu_pkg::ZERO_REG);
                 t.is_ret = (rd == 5'd0) && ((rs1 == 5'd1) || (rs1 == 5'd5)); end
             7'h63: begin // conditional branches
                 t.op = cpu_pkg::OP_BR;    t.fu = cpu_pkg::FU_BR;  t.imm = imm_b;
-                t.is_branch = 1'b1; t.rd = 5'd0;   // B-type bits[11:7] are imm, no dest
+                t.rd = 5'd0;   // B-type bits[11:7] are imm, no dest
                 t.uses_rs1 = (rs1 != cpu_pkg::ZERO_REG); t.uses_rs2 = (rs2 != cpu_pkg::ZERO_REG); end
             7'h03: begin // loads
                 t.op = cpu_pkg::OP_LOAD;  t.fu = cpu_pkg::FU_LSU; t.imm = imm_i;
@@ -63,9 +62,6 @@ module decode1 (
             7'h13: begin // I-type ALU
                 t.op = cpu_pkg::OP_ALU;   t.fu = cpu_pkg::FU_ALU; t.imm = imm_i; t.uses_imm = 1'b1;
                 t.uses_rs1 = (rs1 != cpu_pkg::ZERO_REG);
-                if ((f3 == 3'b001) && f7[5]) t.illegal = 1'b1; else
-                if ((f3 == 3'b101) && !(f7[5] == 1'b1 || f7 == 7'b0)) t.illegal = 1'b1; else
-                if ((f3 != 3'b001) && (f3 != 3'b101) && (f7 != 7'b0)) t.illegal = 1'b1;
             end
             7'h33: begin // R-type
                 t.uses_rs1 = (rs1 != cpu_pkg::ZERO_REG); t.uses_rs2 = (rs2 != cpu_pkg::ZERO_REG);
@@ -75,20 +71,20 @@ module decode1 (
                 end else if (f7 == 7'b0100000) begin
                     if (f3 == 3'b000 || f3 == 3'b101) begin
                         t.op = cpu_pkg::OP_ALU; t.fu = cpu_pkg::FU_ALU;
-                    end else begin t.op = cpu_pkg::OP_NOP; t.illegal = 1'b1; end
+                    end else t.op = cpu_pkg::OP_NOP;
                 end else if (f7 == 7'b0) begin
                     t.op = cpu_pkg::OP_ALU; t.fu = cpu_pkg::FU_ALU;
-                end else begin t.op = cpu_pkg::OP_NOP; t.illegal = 1'b1; end
+                end else t.op = cpu_pkg::OP_NOP;
             end
             default: begin
-                t.op = cpu_pkg::OP_NOP; t.illegal = 1'b1;
+                t.op = cpu_pkg::OP_NOP;
             end
         endcase
         out_d = t;
     end
 endmodule
 
-// 2-wide wrapper: two parallel sub-decoders + same-cycle DIV/REM fuse pairing.
+// Two independent lanes; DIV and REM each issue as one instruction.
 module decode (
     input  wire [1:0]       in_valid_s,
     input  wire [63:0]      in_pc_s,    // slot0 low half
@@ -97,30 +93,7 @@ module decode (
     output cpu_pkg::decoded_t  out_d1,
     output wire [1:0]       out_valid
 );
-    cpu_pkg::decoded_t d0, d1;
-    decode1 u0 (.in_pc(in_pc_s[31:0]),  .in_raw(in_raw_s[31:0]), .out_d(d0));
-    decode1 u1 (.in_pc(in_pc_s[63:32]), .in_raw(in_raw_s[63:32]), .out_d(d1));
-
-    // fuse: DIV|DIVU (f3[1:0]=00/01) + REM|REMU (10/11), same rs1/rs2/sign
-    wire divop0 = (d0.op == cpu_pkg::OP_DIV) && (d0.funct3[1:0] == 2'b00 || d0.funct3[1:0] == 2'b01);
-    wire divop1 = (d1.op == cpu_pkg::OP_DIV) && (d1.funct3[1:0] == 2'b00 || d1.funct3[1:0] == 2'b01);
-    wire remop0 = (d0.op == cpu_pkg::OP_DIV) && (d0.funct3[1:0] == 2'b10 || d0.funct3[1:0] == 2'b11);
-    wire remop1 = (d1.op == cpu_pkg::OP_DIV) && (d1.funct3[1:0] == 2'b10 || d1.funct3[1:0] == 2'b11);
-    wire operands_match = (d0.rs1 == d1.rs1) && (d0.rs2 == d1.rs2) &&
-                          (d0.funct3[0] == d1.funct3[0]);
-    wire pair01 = in_valid_s == 2'b11 && operands_match &&
-                  ((divop0 && remop1) || (remop0 && divop1));
-
-    cpu_pkg::decoded_t o0, o1;
-    always_comb begin
-        o0 = d0;
-        o1 = d1;
-        if (pair01) begin
-            o0.is_fuse = 1'b1;
-            o1.is_fuse = 1'b1;
-        end
-        out_d0 = o0;
-        out_d1 = o1;
-    end
+    decode1 u0 (.in_pc(in_pc_s[31:0]),  .in_raw(in_raw_s[31:0]), .out_d(out_d0));
+    decode1 u1 (.in_pc(in_pc_s[63:32]), .in_raw(in_raw_s[63:32]), .out_d(out_d1));
     assign out_valid = in_valid_s;
 endmodule

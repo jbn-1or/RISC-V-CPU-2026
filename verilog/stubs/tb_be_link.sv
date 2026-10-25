@@ -34,7 +34,6 @@ module tb_be_link;
 
     // ---------------- fe driver ----------------
     logic [31:0] fpc;
-    logic [5:0]  bsf_cnt;
     logic [1:0]  fe_valid;
     fe2rn_t fe0, fe1;
 
@@ -47,14 +46,10 @@ module tb_be_link;
 
     always_comb begin
         fe0 = '0;
-        fe0.valid = (fpc < 32'd96);
         fe0.insn  = d0;
-        fe0.bsf   = bsf_cnt;
         fe1 = '0;
-        fe1.valid = (fpc < 32'd92);
         fe1.insn  = d1;
-        fe1.bsf   = bsf_cnt + {5'b0, d0.is_branch};
-        fe_valid  = {fe1.valid, fe0.valid};
+        fe_valid  = {(fpc < 32'd92), (fpc < 32'd96)};
     end
 
     // ---------------- core ----------------
@@ -79,14 +74,11 @@ module tb_be_link;
 
     always_ff @(posedge clock) begin
         if (reset) begin
-            fpc <= 32'd0; bsf_cnt <= 6'd0;
+            fpc <= 32'd0;
         end else if (flush_out.valid) begin
             fpc <= flush_out.pc;
-            bsf_cnt <= flush_out.bsf + 6'd1;
         end else if (fe_take[0]) begin
             fpc <= fpc + (fe_take[0] ? 32'd4 : 32'd0) + (fe_take[1] ? 32'd4 : 32'd0);
-            bsf_cnt <= bsf_cnt + {5'b0, (fe_take[0] && d0.is_branch)} +
-                                  {5'b0, (fe_take[1] && d1.is_branch)};
         end
     end
 

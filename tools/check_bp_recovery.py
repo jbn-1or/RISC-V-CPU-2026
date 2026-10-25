@@ -14,7 +14,7 @@ from toolchain import DEFAULT_APPIMAGE, enter_appimage, packaged_tool
 
 CONFIGS = {'default': {}, 'ghr0': {'BP_GHR_BITS': 0}, 'ghr1': {'BP_GHR_BITS': 1},
            'ghr4': {'BP_GHR_BITS': 4}, 'ghr12': {'BP_GHR_BITS': 12},
-           'bht128': {'BHT_ENTRIES': 128}}
+           'bht128': {'BHT_ENTRIES': 128}, 'bht256': {'BHT_ENTRIES': 256}}
 
 
 def main():

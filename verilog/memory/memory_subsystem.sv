@@ -5,7 +5,7 @@
 // cycle later and is recorded with the write tag; a missed store invalidates
 // its set when AXI B returns to prevent a concurrent fill from leaving stale data.
 //
-// Response priority: buffered store completion > current AXI B > D$ load.
+// Response priority: AXI B store completion > D$ load.
 // Store completions cannot be backpressured; load responses wait in the D$ FIFO.
 module memory_subsystem (
     input  wire        clock,
@@ -53,7 +53,7 @@ module memory_subsystem (
     output wire [3:0]  wr_push_tag,
     input  wire        wr_push_ready,
     input  wire        wr_rsp_valid,
-    input  wire [3:0]  wr_rsp_tag,
+    input  wire [3:0]  wr_rsp_tag
 );
     // ---------------- D$ ----------------
     localparam int RB = $clog2(cpu_pkg::ROB_DEPTH);
@@ -119,8 +119,6 @@ module memory_subsystem (
     assign wr_push_tag   = seq_q;
 
     // ---------------- response merge ----------------
-    logic       sp_v;          // buffered store completion
-    logic [RB-1:0] sp_rob;
     wire [RB-1:0] wr_rob = tagrob[wr_rsp_tag];
 
     // store-completion line invalidate: a drain that missed the D$ may have
@@ -134,18 +132,16 @@ module memory_subsystem (
         inv_addr  = tagaddr[wr_rsp_tag];
     end
 
-    wire out_pend = sp_v;
-    wire out_wr   = !sp_v && wr_rsp_valid;
-    wire out_ld   = !sp_v && !wr_rsp_valid && dc_rsp_valid;
-    wire dc_response_take = out_ld;          // D$ FIFO drains only when selected
+    // At most one B response arrives per cycle and the LSQ always accepts
+    // it. A coincident load response stays in the D$ FIFO until selected.
+    wire out_ld = !wr_rsp_valid && dc_rsp_valid;
+    wire dc_response_take = out_ld;
 
     always_comb begin
         resp = '0;
-        resp.valid   = out_pend || out_wr || out_ld;
-        resp.is_store = out_pend || out_wr;
-        if (out_pend)      resp.rob   = sp_rob;
-        else if (out_wr)   resp.rob   = wr_rob;
-        else               resp.rob   = dc_rsp_token;
+        resp.valid    = wr_rsp_valid || out_ld;
+        resp.is_store = wr_rsp_valid;
+        resp.rob      = wr_rsp_valid ? wr_rob : dc_rsp_token;
         // The data payload is consumed only for a valid load response.
         resp.rdata = dc_rsp_data;
     end
@@ -156,23 +152,12 @@ module memory_subsystem (
     always_ff @(posedge clock) begin
         if (reset) begin
             seq_q <= 4'd0;
-            sp_v <= 1'b0;
-            sp_rob <= 5'd0;
             tw_v <= 1'b0;
             tw_tag <= 4'd0;
             tw_addr <= 32'd0;
             tw_rob <= '0;
             tw_unc <= 1'b0;
         end else begin
-            // store completion buffer: drains every cycle it is set; a B that
-            // cannot be output this cycle (buffer occupied) replaces it
-            if (wr_rsp_valid && sp_v) begin
-                sp_v   <= 1'b1;
-                sp_rob <= wr_rob;
-            end else begin
-                sp_v <= 1'b0;
-            end
-
             if (tw_v) begin
                 tagrob[tw_tag]  <= tw_rob;
                 tagaddr[tw_tag] <= tw_addr;

@@ -45,7 +45,7 @@ module iq (
     output logic              iss0_v,
     output logic [$clog2(cpu_pkg::ROB_DEPTH)-1:0]     iss0_rob,
     output logic              iss1_v,
-    output logic [$clog2(cpu_pkg::ROB_DEPTH)-1:0]     iss1_rob,
+    output logic [$clog2(cpu_pkg::ROB_DEPTH)-1:0]     iss1_rob
 );
     localparam int D = cpu_pkg::IQ_DEPTH;
     localparam int SB = (D > 1) ? $clog2(D) : 1;   // slot index bits
@@ -60,7 +60,6 @@ module iq (
     logic [PB-1:0] ps2_q [0:D-1];
     logic [PB-1:0] pdst_q[0:D-1];
     logic [RB-1:0] rob_q [0:D-1];
-    logic [5:0]   bsf_q [0:D-1];
     logic [$clog2(cpu_pkg::BHT_ENTRIES)-1:0] bix_q [0:D-1];
     logic [2:0]   fu_q  [0:D-1];
     logic         pt_q  [0:D-1];
@@ -209,7 +208,6 @@ module iq (
         iss0.ps2         = ps2_q[s0];
         iss0.pdst        = pdst_q[s0];
         iss0.rob         = rob_q[s0];
-        iss0.bsf         = bsf_q[s0];
         iss0.pred_taken  = pt_q[s0];
         iss0.pred_target = ptg_q[s0];
         iss0.bix         = bix_q[s0];
@@ -223,7 +221,6 @@ module iq (
         iss1.ps2         = ps2_q[s1];
         iss1.pdst        = pdst_q[s1];
         iss1.rob         = rob_q[s1];
-        iss1.bsf         = bsf_q[s1];
         iss1.pred_taken  = pt_q[s1];
         iss1.pred_target = ptg_q[s1];
         iss1.bix         = bix_q[s1];
@@ -257,7 +254,7 @@ module iq (
                 r2_q[pos0]  <= d0.rs2_ready || d0w2a || d0w2b;
                 ps1_q[pos0] <= d0.ps1;   ps2_q[pos0] <= d0.ps2;
                 pdst_q[pos0]<= d0.pdst;  rob_q[pos0] <= d0.rob;
-                bsf_q[pos0] <= d0.bsf;   fu_q[pos0]  <= d0.insn.fu;
+                fu_q[pos0]  <= d0.insn.fu;
                 pt_q[pos0]  <= d0.pred_taken; ptg_q[pos0] <= d0.pred_target;
                 bix_q[pos0] <= d0.bix;
                 insn_q[pos0]<= d0.insn;
@@ -269,7 +266,7 @@ module iq (
                 r2_q[pos1]  <= d1.rs2_ready || d1w2a || d1w2b;
                 ps1_q[pos1] <= d1.ps1;   ps2_q[pos1] <= d1.ps2;
                 pdst_q[pos1]<= d1.pdst;  rob_q[pos1] <= d1.rob;
-                bsf_q[pos1] <= d1.bsf;   fu_q[pos1]  <= d1.insn.fu;
+                fu_q[pos1]  <= d1.insn.fu;
                 pt_q[pos1]  <= d1.pred_taken; ptg_q[pos1] <= d1.pred_target;
                 bix_q[pos1] <= d1.bix;
                 insn_q[pos1]<= d1.insn;

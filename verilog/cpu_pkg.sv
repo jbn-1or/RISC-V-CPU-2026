@@ -17,7 +17,6 @@ package cpu_pkg;
     parameter int LDQ_DEPTH    = 8;
     parameter int STQ_DEPTH    = 16;
     parameter int MUL_LAT      = 4;     // 乘法流水级数
-    parameter int DIV_LAT_MAX  = 32;    // 除法迭代上限（radix-2，运行期提前退出）
 
     // ---- Memory: 1/2-way I$/D$, fixed total capacity at each line count ----
     parameter int LINE_BYTES   = 32;    // 行大小（16 或 32 B：4/8 × AXI 字）
@@ -28,7 +27,7 @@ package cpu_pkg;
     parameter int AXI_MAX_RD   = 8;     // 在飞 AXI 读上限（≤ 从机队列 16 − 裕量）
     parameter int AXI_MAX_WR   = 8;     // 在飞 AXI 写上限
     // ---- Branch prediction ----
-    parameter int BHT_ENTRIES  = 256;
+    parameter int BHT_ENTRIES  = 128;
     parameter int BTB_ENTRIES  = 64;
     parameter int RAS_DEPTH    = 16;
     // gshare GHR width: BHT index = pc[index] ^ ghr. 0 = plain pc-indexed BHT.
@@ -37,7 +36,6 @@ package cpu_pkg;
     parameter int BP_GHR_BITS  = 8;
 
     // ---- 通用常量 ----
-    localparam logic [31:0] EXIT_ADDR = 32'h8000_0000;  // 退出 MMIO 地址
     localparam logic [4:0]  ZERO_REG  = 5'd0;           // x0
 
     // ---- AXI 请求源标记（响应路由用）----
@@ -68,13 +66,9 @@ package cpu_pkg;
         logic        uses_rs1;   // 是否读 rs1（重命名/记分牌用）
         logic        uses_rs2;
         logic        uses_imm;   // OP_ALU 的 B 端口取 imm（I 型算术置 1）
-        logic        is_branch;  // 控制流指令（预测/冲刷用）：条件分支与 JALR 置 1
         logic        is_ret;     // 返回指令（JALR 且 rs1∈{x1,x5} 且 rd=x0）：RAS 弹栈/RAS 预测
-        logic        is_exit;    // 退出写，必须按序提交（译码期恒 0；退出在运行期地址判定）
-        logic        is_fuse;    // DIV/REM 配对标记；当前后端仍分别执行
         logic [2:0]  funct3;     // 原始 funct3：ALU 子操作 / 分支条件类型 / load-store 宽度与符号
         logic [6:0]  funct7;     // 原始 funct7：区分 add-sub、srl-sra 等（op_e 已区分 M 扩展大类）
-        logic        illegal;    // 未实现/保留编码（CSR/FENCE/ECALL/EBREAK 等）置位，仅自检用
     } decoded_t;
 
     // ---- 写回事件：执行单元 -> ROB ----
@@ -90,7 +84,6 @@ package cpu_pkg;
         logic        valid;   // 本拍发生误预测冲刷
         logic [31:0] pc;      // 重定向 PC（taken→目标，not-taken→pc+4）
         logic [$clog2(ROB_DEPTH)-1:0] rob; // 肇事分支 ROB 号（冲刷严格年幼于它）
-        logic [5:0]  bsf;     // 该分支之前 FE 已译码的分支计数（模 64），供 FE 截断幼年指令
     } flush_t;
 
     // ---- LSQ -> memory_subsystem: separate load and store valid/ready channels ----
@@ -118,9 +111,7 @@ package cpu_pkg;
 
     // ---- Frontend -> rename: two IFB entries, accepted as a prefix ----
     typedef struct packed {
-        logic        valid;
         decoded_t    insn;
-        logic [5:0]  bsf;          // 该指令之前 FE 已译码分支数（mod 64）
         logic        pred_taken;   // BP 方向/返回猜测
         logic [31:0] pred_target;  // 预测目标（RAS/BTB，无则 0）
         logic [$clog2(BHT_ENTRIES)-1:0] bix;  // gshare BHT 索引（取指时算好，随指令到 BRU 训练；位宽随 BHT_ENTRIES）
@@ -136,7 +127,6 @@ package cpu_pkg;
         logic [$clog2(PRF_NUM)-1:0] pdst;
         logic [$clog2(PRF_NUM)-1:0] old_pdst;
         logic [$clog2(ROB_DEPTH)-1:0] rob;
-        logic [5:0]  bsf;
         logic        pred_taken;
         logic [31:0] pred_target;
         logic [$clog2(BHT_ENTRIES)-1:0] bix;
@@ -149,7 +139,6 @@ package cpu_pkg;
         logic [$clog2(PRF_NUM)-1:0] ps2;
         logic [$clog2(PRF_NUM)-1:0] pdst;
         logic [$clog2(ROB_DEPTH)-1:0] rob;
-        logic [5:0]  bsf;
         logic        pred_taken;
         logic [31:0] pred_target;
         logic [$clog2(BHT_ENTRIES)-1:0] bix;

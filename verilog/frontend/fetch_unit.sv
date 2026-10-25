@@ -53,11 +53,10 @@ module fetch_unit (
     input  wire        rd_rsp_valid,
     input  wire [4:0]  rd_rsp_idx,
     input  wire [31:0] rd_rsp_data,
-    output wire        rd_rsp_ready,
+    output wire        rd_rsp_ready
 );
     logic [31:0] pc_r;
     logic        half_r;
-    logic [5:0]  bsf_r;
 
     logic [31:0] r_pc_q;
     logic        r_half_q;
@@ -113,7 +112,6 @@ module fetch_unit (
     wire cpu_pkg::decoded_t first_insn = first_is1 ? dec_d1 : dec_d0;
     wire first_ret  = first_is1 ? d1_ret  : d0_ret;
     wire first_link = first_is1 ? d1_link : d0_link;
-    wire [5:0] first_bsf = bsf_r;
 
     wire        bp_s0_hit, bp_s1_hit;
     wire [31:0] bp_s0_top, bp_s1_top;
@@ -230,20 +228,19 @@ module fetch_unit (
     cpu_pkg::fe2rn_t eA, eB;
     always_comb begin
         eA = '0;
-        eA.valid = 1'b1; eA.insn = A_insn; eA.bsf = first_bsf;
+        eA.insn = A_insn;
         eA.pred_taken = f_pred_taken; eA.pred_target = f_pred_target;
         eA.bix = bp_lk0_ix;
         eB = '0;
-        eB.valid = 1'b1; eB.insn = dec_d1; eB.bsf = B_bsf;
+        eB.insn = dec_d1;
         eB.pred_taken = s_pred_taken; eB.pred_target = s_pred_target;
         eB.bix = bp_lk1_ix;
     end
-    wire [5:0] B_bsf = first_bsf + {5'b0, dec_d0.is_branch};
 
     always_ff @(posedge clock) begin
         if (reset) begin
             ifb_head <= 3'd0; ifb_tail <= 3'd0; ifb_cnt <= 4'd0;
-            pc_r <= 32'd0; half_r <= 1'b0; bsf_r <= 6'd0;
+            pc_r <= 32'd0; half_r <= 1'b0;
             r_pend_q <= 1'b0; r_pc_q <= 32'd0; r_half_q <= 1'b0;
         end else begin
             r_pend_q <= issue_ok;
@@ -252,7 +249,7 @@ module fetch_unit (
                 r_half_q <= req_half;
             end
 
-            // ---- PC / bsf update (pipelined: one request per cycle) ----
+            // ---- PC update (pipelined: one request per cycle) ----
             if (flush.valid) begin
                 // If the flush-target request was issued this cycle,
                 // advance past it; otherwise restart at the target next cycle.
@@ -263,11 +260,9 @@ module fetch_unit (
                     pc_r   <= flush.pc & 32'hfffffff8;
                     half_r <= flush.pc[2];
                 end
-                bsf_r  <= flush.bsf + 6'd1;
             end else if (miss_det) begin
                 pc_r   <= r_pc_q;      // re-request the missed block after refill
                 half_r <= r_half_q;
-                // bsf_r held: the same block is re-fetched
             end else if (redirect) begin
                 // The target request was issued this cycle (req_pc), so
                 // advance past it; if the port was busy / IFB full, restart at
@@ -279,27 +274,18 @@ module fetch_unit (
                     pc_r   <= red_target & 32'hfffffff8;
                     half_r <= red_target[2];
                 end
-                bsf_r  <= first_bsf + {5'b0, first_insn.is_branch} +
-                          (has_second ? {5'b0, dec_d1.is_branch} : 6'd0);
             end else begin
                 if (issue_ok) begin
                     pc_r   <= pc_r + 32'd8;
                     half_r <= 1'b0;
                 end
-                // bsf advances with the consumed (pushed) block, independent of
-                // whether a new request is issued this cycle
-                if (resp_ok)
-                    bsf_r  <= bsf_r + {5'b0, (push0 && (first_is1 ? dec_d1.is_branch :
-                                                                  dec_d0.is_branch))} +
-                                     {5'b0, (push1 && dec_d1.is_branch)};
             end
 
             // ---- IFB update ----
             if (flush.valid) begin
                 // Fetch/rename dispatch in order. A resolving branch has
                 // already left the IFB, so every buffered instruction is
-                // younger. Clear all entries without a half-ring age bound;
-                // larger ROB windows can exceed that bound or wrap bsf.
+                // younger. No per-entry age metadata is needed here.
                 ifb_tail <= ifb_head;
                 ifb_cnt <= '0;
             end else begin

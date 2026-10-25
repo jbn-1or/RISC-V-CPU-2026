@@ -2,7 +2,7 @@
 // chained intra-cycle renaming (slot1 sees slot0's mapping), prefix-sliced
 // dispatch backpressure, and same-cycle flush recovery from the ROB snapshot.
 //
-// State is expressed as 64-bit tag bitmaps (PRF_NUM=64):
+// Each tag bitmap has PRF_NUM bits:
 //   free_q : allocatable tags;  busy_q : allocated but not yet written back;
 //   pend_q : physical destinations of killed instructions, held until their
 //            (now suppressed) writeback actually arrives — this keeps a stale
@@ -68,15 +68,8 @@ module rename (
     // already been re-allocated. Same-cycle flush+beat (the beat IS the
     // reclaiming event) stays covered via flush_pend_mask.
     wire [cpu_pkg::PRF_NUM-1:0] rec_eff = reclaim_mask & (pend_q | flush_pend_mask);
-    wire [cpu_pkg::PRF_NUM-1:0] fe      = (free_q | rel_msk) & ~pend_q & ~ONE;   // p0 excluded
+    wire [cpu_pkg::PRF_NUM-1:0] fe      = free_q & ~pend_q & ~ONE;   // p0 excluded
     wire [PB-1:0]  alc0    = lowest(fe);
-
-    logic [PB:0] free_cnt;
-    always_comb begin
-        free_cnt = '0;
-        for (int i = 0; i < cpu_pkg::PRF_NUM; i = i + 1)
-            free_cnt = free_cnt + {{PB{1'b0}}, fe[i]};
-    end
 
     // ---------------------------------------------------------------
     // operand / destination resolution
@@ -93,15 +86,13 @@ module rename (
     wire [cpu_pkg::PRF_NUM-1:0] fe1  = fe & ~(need0 ? (ONE << alc0) : '0);
     wire [PB-1:0]  alc1 = lowest(fe1);
 
-    logic [PB:0] need_all;
-    always_comb need_all = {{PB{1'b0}}, need0} + {{PB{1'b0}}, need1};
-
+    // A lane needs only one available tag. Slot 1 checks the remaining
+    // bitmap after slot 0's allocation, so no free-tag count is needed.
     wire take0 = !flush_valid && in_valid[0] &&
                  (rob_space >= 'd1) && (iq_space != '0) &&
-                 (need0 ? (free_cnt != '0) : 1'b1);
+                 (!need0 || (fe != '0));
     wire take1 = (cpu_pkg::DECODE_WIDTH == 2) && take0 && in_valid[1] &&
                  (rob_space >= 'd2) && (iq_space >= 'd2) &&
-                 (need_all <= free_cnt) &&
                  (!need1 || (fe1 != '0));
 
     // slot 0
@@ -150,7 +141,6 @@ module rename (
         iq_d0.pdst       = s0_pdst;
         iq_d0.old_pdst   = s0_old;
         iq_d0.rob        = rob_alloc_ptr;
-        iq_d0.bsf        = in0.bsf;
         iq_d0.pred_taken = in0.pred_taken;
         iq_d0.pred_target= in0.pred_target;
         iq_d0.bix        = in0.bix;
@@ -164,7 +154,6 @@ module rename (
         iq_d1.pdst       = s1_pdst;
         iq_d1.old_pdst   = s1_old;
         iq_d1.rob        = rob_alloc_ptr + 1'b1;
-        iq_d1.bsf        = in1.bsf;
         iq_d1.pred_taken = in1.pred_taken;
         iq_d1.pred_target= in1.pred_target;
         iq_d1.bix        = in1.bix;

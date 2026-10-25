@@ -68,7 +68,6 @@ module student_top (
 
     wire             co_redir_valid;
     wire [31:0]      co_redir_pc, co_redir_next_pc;
-    wire [5:0]       co_redir_bsf;
 
     // Combinational early redirect (BRU resolve cycle) -> frontend.
     // The frontend's flush is advanced one cycle (the backend still receives
@@ -86,7 +85,6 @@ module student_top (
         if (cpu_pkg::EARLY_REDIRECT != 0) begin
             fe_flush.valid = co_redir_valid;
             fe_flush.pc    = co_redir_pc;
-            fe_flush.bsf   = co_redir_bsf;
         end
     end
 
@@ -127,7 +125,7 @@ module student_top (
         .fe_valid, .fe0, .fe1, .fe_take, .flush_out(flush),
         .flush_dtail_out(co_flush_dtail),
         .redir_valid(co_redir_valid), .redir_pc(co_redir_pc),
-        .redir_next_pc(co_redir_next_pc), .redir_bsf(co_redir_bsf),
+        .redir_next_pc(co_redir_next_pc),
         .br_upd_valid, .br_upd_pc, .br_upd_taken, .br_upd_ix, .br_upd_mispred,
         .btb_upd_valid, .btb_upd_pc, .btb_upd_target,
         .ld_valid(co_ld_valid), .ld_req(co_ld_req), .ld_ready(co_ld_ready),
@@ -191,7 +189,7 @@ module student_top (
         .wr_push_strb(la_wr_strb), .wr_push_tag(la_wr_tag), .wr_push_ready(la_wr_ready),
         .wr_rsp_valid(la_wr_rsp_valid), .wr_rsp_tag(la_wr_rsp_tag),
         .araddr, .arvalid, .arready,
-        .rdata, .rresp, .rvalid, .rready,
+        .rdata, .rresp, .rvalid, .rready, .rd_rsp_err(),
         .awaddr, .awvalid, .awready,
         .wdata, .wstrb, .wvalid, .wready,
         .bvalid, .bready);

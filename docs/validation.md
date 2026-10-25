@@ -1,88 +1,63 @@
-**2026-10-24：当前默认 CPU 在官方流程下同时达到 Tier 3 的面积、频率和 IPC 门槛。** 唯一要求来源为恢复后的官方 [README-EN.md](../README-EN.md)。面积/频率与 IPC 对应同一份最终生产 RTL，输入 SHA256 已核对。
+**最新验证（2026-10-25）：局部逻辑简化后，用户三项标准全部通过。**
 
-| 指标 | 最终实测 | Tier 3 门槛 |
-| --- | ---: | ---: |
-| 总面积，含 SRAM | **30186.042410 µm²** | <36,000 µm² |
-| 综合频率 | **300.822562 MHz** | >300 MHz |
-| 最小周期 | **3.32421875000 ns** | <3.333333333 ns |
-| LAT=10 六项 IPC 几何平均 | **1.104759628915139** | ≥1.0985 |
-| 官方正确性 | **19/19** | 通过 |
-| LAT=1/50 延迟矩阵 | **8/8** | 全部通过 |
-| RV32IM 自检 | **5,307 项 × LAT=1/10/50** | 全部通过 |
-| 单元测试 | **14/14** | 全部通过 |
+| 指标 | 简化前基线 | 当前实测 | 用户标准 |
+| --- | ---: | ---: | ---: |
+| 总面积，含 SRAM，µm² | 29616.839210 | 29824.822910 | <36000 |
+| 频率，MHz | 352.132050 | 346.414073 | >330 |
+| IPC 几何平均 | 1.101955112159 | 1.101955112159 | >1.1 |
 
-IPC 比面积/频率阶段的 0.896022346877662 提高 **23.30%**。频率是课程默认理想时钟、无布线寄生的综合 STA 结果，未进行布局布线。2 ns 是综合优化目标；Tier 3 按实测最小周期和频率判断。
+本轮只修改 `rename.sv` 和 `memory_subsystem.sv`，共减少 24 行：以两路已有的空闲位图代替全量 tag 计数，删除不可达的 store 完成缓冲。25 个官方用例的结果及周期与基线逐项一致。面积和频率使用同一份新 RTL 的官方默认 opt 综合及 OpenSTA 流程，未更改库、时钟目标、负载、SRAM 模型或官方测试。
 
-当前频率距门槛约 0.823 MHz；结果对应本页记录的源码 SHA256、默认官方工具和约束，后续 RTL 变更需要重新综合。
+本轮重新通过官方正确性 19/19（含 π）、性能 6/6、ISA 自检 5307 项 × 延迟 1/10/50、8 项延迟边界、8 个相关单测，以及种子 202610264–202610287 × 三个延迟的 72 组随机混合流。rename 在默认、PRF128、DECODE_WIDTH=1 下通过模块等价；memory_subsystem 在 ROB16/32/64 下通过复位后的归纳等价检查，未修改的 D$ 作为共同的无约束接口边界。没有对整个 CPU 作形式化证明，也没有重跑本轮网表仿真或八组完整参数变体。
 
-**最终配置与实现**
+当前证据：`build/readability_20261025/candidate/verification.json`、`audit.json`、`baseline_cycles.json`、`synth/opt/report.json`；等价脚本和日志见 `build/readability_20261025/equivalence/`。逐项改动与复现命令见 [readability-2026-10-25.md](readability-2026-10-25.md)。π 的百万周期默认上限限制仍然存在，完整正确性测试使用 `MAX_CYCLES=20000000`。
 
-双发射/双提交，ROB32、PRF64、IQ8、LDQ8、STQ16、MUL_LAT=4，I$ 64 行（2 KiB）、D$ 512 行（16 KiB）、32 B line、直接映射、2 MSHR、BHT256、BTB64、RAS16。`WB_BYPASS=1`，`EARLY_REDIRECT=0`。
+---
 
-恢复同拍旁路与较大的调度窗口；保留寄存的前端恢复。IQ 使用并行年龄检查及两级轮转资格掩码，保持原发射次序和功能单元约束。LSQ 将 guard/load/完成候选改为并行年龄比较和资格掩码归约；恢复拍暂停 load 调度，保留较老 load，退休 store 继续 drain。完整设计取舍见 [report.md](report.md) 与 [architecture.md](architecture.md)。
+以下保留简化前频率优化阶段的历史记录；其中的“当前”及门级/参数变体结果均指该历史版本。
 
-此前修复的 SRA/SRAI、结构体数组展开、真实参数化、ROB 并行恢复和 store 同拍数据捕获均保留。另修复 ROB64 下 IFB 的半环恢复边界：恢复时直接清空所有尚未分派的年轻 IFB 项。最终没有引入分配回绕位、原始写回唤醒或额外 store 流水级。
+**2026-10-25：频率优化完成，默认配置同时满足 Tier 3。** 唯一要求来源为 [README-EN.md](../README-EN.md)。仅将 rename 的分配候选改为寄存后的 free_q；本拍提交/回收释放的 tag 下一拍参与分配。默认参数、发射策略、同拍写回旁路和恢复协议保持原样。
 
-**官方文件与已知问题**
+| 指标 | 优化前 | 当前实测 | Tier 3 门槛 |
+| --- | ---: | ---: | ---: |
+| 总面积，含 SRAM，µm² | 29906.208470 | 29616.839210 | ≤36000 |
+| 频率，MHz | 300.205218 | 352.132050 | ≥300 |
+| IPC 几何平均 | 1.101955112159 | 1.101955112159 | ≥1.0985 |
 
-README-EN.md、README-ZH.md、config.mk 与 upstream/main 一致；Makefile、scripts/、官方接口文档、Dockerfile、packaging/、测试子模块及 .gitmodules 未改变。未修改官方工具链、库、SRAM 成本模型或时序约束以取得结果。
+用户目标为约 330 MHz；当前实测约 352 MHz，较 300 MHz 门槛高约 52.132 MHz。频率较原版提升约 17.30%，面积减少约 289.369 µm²。25 个官方用例周期均与优化前一致。面积、频率和 IPC 均来自同一组生产源码，没有组合不同配置的指标。综合使用官方默认 opt 流程、2 ns 目标、驱动、负载和 SRAM 成本模型。
 
-[KI-001：部分基准门级/RTL 周期差异](known-issues.md) 已定位并修复。BP 的连续位切片在 Verilator/Yosys 中产生不同 PC 位连接，改为单次切片后，原有 RTL 六项计数不变，实际综合网表的 24 个官方用例（最终门级集不含 π）和 8 个延迟边界用例均与 RTL 周期一致。门级 5,307 项 ISA 自检在 LAT=1/10/50 均通过，三组周期也与 RTL 相同。此为已测程序的功能与周期检查，未宣称形式化等价。
+本次验证全部通过：
 
-**复现与审计**
+- 官方正确性 19/19（包含 π），LATENCY=10 官方性能 6/6。
+- 5,307 项 ISA 检查 × LATENCY=1/10/50；8 项延迟边界测试。
+- 14/14 单测；24 个种子的随机混合流 × 三个延迟，共 72/72。
+- 八个参数变体各通过官方正确性 19/19 和性能 6/6；快照逐文件核对为当前 RTL 加声明的参数变化。
+- 实际综合网表通过 24 个官方用例及 8 个延迟边界比较，功能和周期均与 RTL 一致；门级 ISA 三组结果也与 RTL 相同。门级集不含 π；完整 π 在 RTL 中通过。
+- 严格审计通过：当前源码哈希、opt/SHARE、IFB/IQ/写回 FIFO 完整展开、BP 恢复 PC 连接、SRAM 宏和地址驱动。D$ 保留 32 个 512×8 宏及 9 位 row 地址。
+
+**实现与复现**
+
+`verilog/backend/rename.sv` 不再把组合 rel_msk 直接并入当前分配候选，切断提交/回收到 free-tag 优先选择器的同拍依赖。free_q 的更新、pending tag 隔离和回收规则保留；代价是刚释放的 tag 最早下一拍可用。默认官方测试中未观察到性能周期增加；其他配置的 IPC 见 [report.md](report.md)。
 
 ```sh
-make code BUILD=build/check/sim JOBS=4
+make code BUILD=build/check/rtl JOBS=4
 make test SIM=./code MAX_CYCLES=20000000 LATENCY=10
 make perf SIM=./code MAX_CYCLES=20000000 LATENCY=10 > build/check_perf.log
-python3 tools/run_latency.py --sim ./code --log build/check_latency.log
-python3 tools/run_isa.py --sim ./code --out build/check_isa
-python3 tools/run_unit.py tb_lsq_recovery
-python3 tools/run_unit.py tb_lsu
-make synth SYNTH_OUT=build/check_synth
-python3 tools/check_tier3.py --synth build/check_synth/opt \
-  --perf-log build/check_perf.log --out build/check_audit.json
+python3 tools/run_isa.py --sim ./code --out build/check/isa
+python3 tools/run_latency.py --sim ./code --log build/check/latency.log
+make synth SYNTH_OUT=build/check/synth
+python3 tools/check_tier3.py --synth build/check/synth/opt --perf-log build/check_perf.log
+python3 tools/run_configs.py --configs issue1 assoc2 rob16 rob64 iq4 prf128 decode1 cache_small --benchmark-only --out build/check/variants
+python3 tools/build_gate.py --synth build/check/synth/opt --out build/check/gate
+python3 tools/compare_cycles.py --rtl ./code --gate build/check/gate/sim/sim --exclude-cases correctness_pi --jobs 3 --out build/check/gate_cycles.json
 ```
 
-严格审计默认检查三项门槛及实际展开的 BP 恢复 PC 位连接，最终 `passed=true`、`tier3_passed=true`。不使用只检查面积/频率的阶段模式。源码哈希、原生 `opt` 及 SHARE、完整 IFB/IQ/写回 FIFO、SRAM 宏和地址驱动、无 ERROR/latch/端口 resize 均通过。当前 IFB 为 8×152 bits，IQ 指令存储为 8×104 bits，每个写回 FIFO 为 4×44 bits；D$ 有 32 个 `512x8` 宏，物理地址 9 位全部驱动，I$ 有两个 `256x32` 宏。
+π 实测需要 10,100,155 周期；一百万是框架默认上限，完整测试应提高 MAX_CYCLES。README 未将该默认值定义为独立评分门槛。
 
-| 基准 | 动态指令 | 周期 |
-| --- | ---: | ---: |
-| perf_median | 6,961 | 8,201 |
-| perf_multiply | 21,722 | 18,474 |
-| perf_qsort | 139,900 | 159,846 |
-| perf_rsort | 195,719 | 132,054 |
-| perf_towers | 5,278 | 4,937 |
-| perf_vvadd | 4,524 | 3,444 |
+**证据与边界**
 
-几何平均由整数指令/周期数重新计算，未使用四位小数 IPC 反算。
+本次产物位于 `build/freq330_20261025/registered_free/`。`verification.json` 汇总生产源、RTL/门级模拟器哈希、三项门槛、参数变体和回归结果；`baseline_comparison.json` 保留 25 个官方用例的前后周期比较。当前 verilog/ 与综合冻结副本逐字节一致，根目录 code 与正式 RTL 模拟器 SHA256 一致。
 
-最终产物位于 `build/final_compliance/`（Git 忽略）：`rtl/` 为最终 RTL 回归，`synth/opt/` 为官方默认综合，`final_audit.json` 为严格审计，`units/` 为 14 个单测，`variants/` 为最终八参数变体，`build/cycle_audit/bp_matrix/` 为六配置下的 RTL/Yosys BP 测试，`gate/` 为实际网表模型，`after_cycles.json` 和 `after_latency_cycles.json` 为 24+8 个周期比较，`gate_isa/` 为门级 ISA 自检。`verification.json` 汇总源码/仿真器/网表 SHA256、全部结果与官方文件边界；根目录 `code` 由相同生产源生成。
+此前简化后的 300.205 MHz 基线保留在 `build/simplify_verified_20261025/bht128/`。IQ 年龄矩阵候选实测仅 301.354 MHz，未采用；其余未完成的探索已停止，不作为当前指标。生产 RTL 本轮只改 rename 一行。框架、官方测试、README、SRAM 模型、库与约束没有修改。
 
-八个最终参数变体分别通过官方正确性 19/19 和性能 6/6；默认最终版本完整执行 ISA、延迟、单测和门级比较。此前 IPC 优化与参数探索的历史记录保留在 `build/ipc_tier3/`。
-
-```sh
-python3 tools/run_configs.py --configs issue1 assoc2 rob16 rob64 iq4 prf128 decode1 cache_small \
-  --benchmark-only --out build/configs --jobs 2 --parallel 2
-```
-
-省略 `--benchmark-only` 会补充每个变体的 ISA 和延迟矩阵；`--perf-only` 仅用于筛选，不提供正确性证据。
-
-**历史结果边界**
-
-面积/频率阶段的 28,683.281810 µm²、375.779817 MHz、IPC 0.896022346877662 保留在 `build/fix_tier3/`。该阶段没有达到完整 Tier 3，当前记录已取代它。先前依赖错误结构体数组展开或 keepdc 包装器的 PPA 已撤回，不能与有效 RTL 的 IPC 混用。
-
-**综合语义回归与门级复现**
-
-```sh
-python3 tools/check_bp_recovery.py --out build/check_bp
-python3 tools/build_gate.py --synth build/check_synth/opt --out build/check_gate --jobs 4
-python3 tools/compare_cycles.py --rtl ./code --gate build/check_gate/sim/sim \
-  --exclude-cases correctness_pi --out build/check_cycles.json --jobs 4
-python3 tools/compare_cycles.py --rtl ./code --gate build/check_gate/sim/sim \
-  --cases correctness_magic correctness_queens correctness_tak correctness_qsort \
-  --latencies 1 50 --out build/check_latency_cycles.json --jobs 4
-python3 tools/run_isa.py --sim build/check_gate/sim/sim --out build/check_gate_isa
-```
-
-BP 定向测试覆盖条件分支与间接跳转的历史恢复，默认、GHR=0/1/4/12 和 BHT128 六组配置在 RTL 与原生 Yosys 输出上均通过。旧版本原生展开的 32 项恢复检查失败，修复后的严格审计新增 `bp_recovery_pc_slice_correct`，会拒绝旧的错误位连接。
+这些是代码审查和有限仿真结果，不是形式化等价证明。团队、提交时间和完整历史 LLM 日志的提交状态仍不能从 RTL 确认。

@@ -78,7 +78,7 @@ module dcache (
     input  wire        rd_rsp_valid,
     input  wire [4:0]  rd_rsp_idx,
     input  wire [31:0] rd_rsp_data,
-    output wire        rd_rsp_ready,
+    output wire        rd_rsp_ready
 );
     localparam int SETB = $clog2(cpu_pkg::DC_LINES);    // set index bits (10 at DC_LINES=1024)
     localparam int WAYB = $clog2(cpu_pkg::ASSOC);

@@ -4,13 +4,12 @@ module tb_div;
     import cpu_pkg::*;
     logic clock = 0, reset = 1;
     logic req_valid; logic [31:0] req_a, req_b;
-    logic [2:0] req_f3a; logic [2:0] req_f3b; logic req_fused;
-    logic [$clog2(cpu_pkg::PRF_NUM)-1:0] ta, tb2; logic [$clog2(cpu_pkg::ROB_DEPTH)-1:0] ra, rb;
+    logic [2:0] req_funct3;
+    logic [$clog2(cpu_pkg::PRF_NUM)-1:0] ta; logic [$clog2(cpu_pkg::ROB_DEPTH)-1:0] ra;
     wire req_ready, wb_valid; wire [$clog2(cpu_pkg::PRF_NUM)-1:0] wb_tag; wire [$clog2(cpu_pkg::ROB_DEPTH)-1:0] wb_rob; wire [31:0] wb_data;
 
-    div u (.clock, .reset, .req_valid, .req_a, .req_b, .req_f3a, .req_f3b,
-           .req_fused, .req_tag_a(ta), .req_rob_a(ra), .req_tag_b(tb2),
-           .req_rob_b(rb), .req_ready, .wb_valid, .wb_tag, .wb_rob, .wb_data);
+    div u (.clock, .reset, .req_valid, .req_a, .req_b, .req_funct3,
+           .req_tag(ta), .req_rob(ra), .req_ready, .wb_valid, .wb_tag, .wb_rob, .wb_data);
 
     always #5 clock = ~clock;
 
@@ -24,9 +23,9 @@ module tb_div;
         opn = (F3 == 3'd4) ? "DIV" : (F3 == 3'd5) ? "DIVU" :
               (F3 == 3'd6) ? "REM" : "REMU";
         @(negedge clock);
-        req_valid = 1; req_a = A; req_b = B; req_f3a = F3; req_f3b = 3'd0;
+        req_valid = 1; req_a = A; req_b = B; req_funct3 = F3;
         $display("[tb] req on a=%h b=%h t=%0t", A, B, $time);
-        req_fused = 1'b0; ta = 6'd1; ra = 5'd2; tb2 = 6'd0; rb = 5'd3;
+        ta = 6'd1; ra = 5'd2;
         @(negedge clock);
         req_valid = 0;   // request already fired at the posedge after drive
         $display("[tb] req off t=%0t", $time);

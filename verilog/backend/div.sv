@@ -1,19 +1,15 @@
 // Iterative divider: top-aligned restoring division with
 // early exit from leading zeros; spec-defined div/rem boundary values.
-// Optional DIV/REM same-source fusion emits both results (two wb beats).
+// One request produces one result; a cached quotient/remainder serves repeated operands.
 module div (
     input  wire        clock,
     input  wire        reset,
     input  wire        req_valid,
     input  wire [31:0] req_a,
     input  wire [31:0] req_b,
-    input  wire [2:0]  req_f3a,     // first op (slot order from dispatch)
-    input  wire [2:0]  req_f3b,     // second op (fused only)
-    input  wire        req_fused,
-    input  wire [$clog2(cpu_pkg::PRF_NUM)-1:0] req_tag_a,
-    input  wire [$clog2(cpu_pkg::ROB_DEPTH)-1:0] req_rob_a,
-    input  wire [$clog2(cpu_pkg::PRF_NUM)-1:0] req_tag_b,
-    input  wire [$clog2(cpu_pkg::ROB_DEPTH)-1:0] req_rob_b,
+    input  wire [2:0]  req_funct3,
+    input  wire [$clog2(cpu_pkg::PRF_NUM)-1:0] req_tag,
+    input  wire [$clog2(cpu_pkg::ROB_DEPTH)-1:0] req_rob,
     output wire        req_ready,
     output wire        wb_valid,
     output wire [$clog2(cpu_pkg::PRF_NUM)-1:0] wb_tag,
@@ -21,14 +17,14 @@ module div (
     output wire [31:0] wb_data
 );
     localparam logic [2:0] S_IDLE = 3'd0, S_PREP = 3'd1, S_STEP = 3'd2,
-        S_FIX = 3'd3, S_EMIT0 = 3'd4, S_EMIT1 = 3'd5, S_FAST = 3'd6;
+        S_FIX = 3'd3, S_EMIT = 3'd4, S_FAST = 3'd5;
 
     logic [2:0] state;
-    logic signed_d, fused_d, rema_d, remb_d;
+    logic signed_d, remainder_d;
     logic [31:0] ub_d, ash_d, acc_d, q_d, a_d, b_d;
     logic [6:0]  step_d;
-    logic [$clog2(cpu_pkg::PRF_NUM)-1:0] taga_d, tagb_d;
-    logic [$clog2(cpu_pkg::ROB_DEPTH)-1:0] roba_d, robb_d;
+    logic [$clog2(cpu_pkg::PRF_NUM)-1:0] tag_d;
+    logic [$clog2(cpu_pkg::ROB_DEPTH)-1:0] rob_d;
     logic [31:0] qout_d, rout_d;
 
     // ---- div/rem pair cache (design-style local optimization) ----
@@ -40,10 +36,9 @@ module div (
     logic        cv_q;
     logic [31:0] ca_q, cb_q, cq_q, cr_q;
     logic        cs_q;
-    wire new_signed = (req_f3a[0] == 1'b0);
-    wire cache_hit = cv_q && !req_fused &&
+    wire new_signed = (req_funct3[0] == 1'b0);
+    wire cache_hit = cv_q &&
                      (req_a == ca_q) && (req_b == cb_q) && (new_signed == cs_q);
-
 
 
     // preparation is combinational on registered a/b
@@ -75,7 +70,7 @@ module div (
     wire [31:0] qout_c = signed_d ? (qneg_c ? (32'b0 - q_d) : q_d) : q_d;
     wire [31:0] rout_c = signed_d ? (an_d ? (32'b0 - acc_d) : acc_d) : acc_d;
 
-    // PREP special cases (b=0 / signed overflow / a=0 / divisor bigger)
+    // PREP special cases: division by zero, signed overflow and zero dividend.
     wire b_zero_p = (b_d == 32'b0);
     wire ovf_p    = signed_d && (a_d == 32'h80000000) && (b_d == 32'hffffffff);
     wire a_zero_p = (a_d == 32'b0);
@@ -83,16 +78,11 @@ module div (
                     (ovf_p    ? 32'h80000000 : 32'b0);
     wire [31:0] rspec_c = b_zero_p ? a_d : 32'b0;
 
-    // emissione per leg
-    wire [31:0] resa_c = rema_d ? rout_d : qout_d;
-    wire [31:0] resb_c = remb_d ? rout_d : qout_d;
-
     assign req_ready = (state == S_IDLE);
-    assign wb_valid  = !reset &&
-        ((state == S_EMIT0) || (fused_d && (state == S_EMIT1)));
-    assign wb_tag  = (state == S_EMIT1) ? tagb_d : taga_d;
-    assign wb_rob  = (state == S_EMIT1) ? robb_d : roba_d;
-    assign wb_data = (state == S_EMIT1) ? resb_c : resa_c;
+    assign wb_valid = !reset && (state == S_EMIT);
+    assign wb_tag = tag_d;
+    assign wb_rob = rob_d;
+    assign wb_data = remainder_d ? rout_d : qout_d;
 
     always_ff @(posedge clock) begin
         if (reset) begin
@@ -104,21 +94,18 @@ module div (
                     // fast path: reuse cached quotient/remainder
                     qout_d <= cq_q;
                     rout_d <= cr_q;
-                    rema_d <= (req_f3a[1] == 1'b1);
-                    fused_d <= 1'b0;
-                    taga_d <= req_tag_a;
-                    roba_d <= req_rob_a;
+                    remainder_d <= (req_funct3[1] == 1'b1);
+                    tag_d <= req_tag;
+                    rob_d <= req_rob;
                     state  <= S_FAST;
                 end else if (req_valid) begin
                     a_d <= req_a; b_d <= req_b;
-                    signed_d <= (req_f3a[0] == 1'b0);
-                    fused_d  <= req_fused;
-                    rema_d   <= (req_f3a[1] == 1'b1); // f3 110/111 -> REM family
-                    remb_d   <= (req_f3b[1] == 1'b1);
-                    taga_d <= req_tag_a; tagb_d <= req_tag_b;
-                    roba_d <= req_rob_a; robb_d <= req_rob_b;
-                    an_d <= (req_f3a[0] == 1'b0) && req_a[31];
-                    sn_d <= (req_f3a[0] == 1'b0) && req_b[31];
+                    signed_d <= (req_funct3[0] == 1'b0);
+                    remainder_d   <= (req_funct3[1] == 1'b1); // f3 110/111 -> REM family
+                    tag_d <= req_tag;
+                    rob_d <= req_rob;
+                    an_d <= (req_funct3[0] == 1'b0) && req_a[31];
+                    sn_d <= (req_funct3[0] == 1'b0) && req_b[31];
                     state <= S_PREP;
                 end
                 S_PREP: begin
@@ -127,13 +114,13 @@ module div (
                         rout_d <= rspec_c;
                         cv_q <= 1'b1; ca_q <= a_d; cb_q <= b_d; cs_q <= signed_d;
                         cq_q <= qspec_c; cr_q <= rspec_c;
-                        state  <= S_EMIT0;
+                        state  <= S_EMIT;
                     end else if (a_zero_p) begin
                         qout_d <= 32'b0;
                         rout_d <= 32'b0;
                         cv_q <= 1'b1; ca_q <= a_d; cb_q <= b_d; cs_q <= signed_d;
                         cq_q <= 32'b0; cr_q <= 32'b0;
-                        state  <= S_EMIT0;
+                        state  <= S_EMIT;
                     end else begin
                         ub_d   <= ub_c;
                         ash_d  <= ua_c << (5'd31 - e_c);
@@ -155,11 +142,10 @@ module div (
                     rout_d <= rout_c;
                     cv_q <= 1'b1; ca_q <= a_d; cb_q <= b_d; cs_q <= signed_d;
                     cq_q <= qout_c; cr_q <= rout_c;
-                    state  <= S_EMIT0;
+                    state  <= S_EMIT;
                 end
-                S_FAST:  state <= S_EMIT0;
-                S_EMIT0: state <= fused_d ? S_EMIT1 : S_IDLE;
-                S_EMIT1: state <= S_IDLE;
+                S_FAST:  state <= S_EMIT;
+                S_EMIT: state <= S_IDLE;
                 default: state <= S_IDLE;
             endcase
         end
